@@ -5,6 +5,7 @@ __pycache__/
 /data/
 /reports/
 /voice_eval/cases/
+/voice_eval/cache/
 /voiceprint/cohorts/
 /voiceprint/checkpoints/ecapa/
 *.db*

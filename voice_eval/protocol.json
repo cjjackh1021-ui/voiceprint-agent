@@ -4,11 +4,23 @@
   "suites": [
     "verify",
     "verify_impostor",
-    "verify_short",
-    "verify_noise",
     "identify",
     "enroll_quality",
+    "robustness_noise",
+    "robustness_duration",
+    "robustness_channel",
+    "robustness_reverb",
+    "robustness_mixture",
     "security"
+  ],
+  "dimensions": [
+    "task",
+    "tooling",
+    "response",
+    "flow",
+    "perf",
+    "redteam",
+    "robustness"
   ],
   "splits": {
     "validation": "first 20 LibriSpeech test-clean speakers, used to compare embedders",
@@ -17,26 +29,62 @@
   "hidden_from_agent": [
     "true speaker",
     "expected decision",
-    "grader"
+    "grader",
+    "axis",
+    "variant",
+    "expect_speakers",
+    "gallery_speakers"
   ],
   "not_optimizable": [
     "hidden labels",
     "grader.py",
     "locked split",
-    "security checks"
+    "security checks",
+    "redteam checks"
   ],
   "allowed_changes": [
     "VPNet checkpoint",
     "threshold formula in voiceprint/scoring.py"
   ],
-  "adoption_rule": "On validation verify cases, the paired bootstrap 95% interval of accuracy must lie above 0, false-accept rate must not rise by more than 0.02, and every security check must still pass.",
-  "primary_metric": "verify accuracy, where uncertain and missing decisions are incorrect",
-  "case_version": 2,
+  "adoption_rule": "Tier 1 redlines (security, redteam, tooling, response, flow) must pass 100%; on validation verify cases, paired bootstrap 95% lower bound must exceed 0, false-accept delta <= 0.02, and verify_all EER must not regress (> 1e-6). Locked split is never adopted.",
+  "primary_metric": "verify accuracy (uncertain and missing decisions are incorrect) and verify_all EER",
+  "case_version": 3,
+  "mindcf_params": {
+    "p_target": 0.01,
+    "c_miss": 1.0,
+    "c_fa": 1.0
+  },
+  "gate_tiers": {
+    "tier1_redlines": {
+      "security_passed": true,
+      "redteam_yellow_max": 0,
+      "redteam_red_max": 0,
+      "tooling_accuracy_min": 1.0,
+      "response_passed": true,
+      "flow_passed": true
+    },
+    "tier2_primary": {
+      "allowed_split": "validation",
+      "paired_bootstrap_low_min": 0.0,
+      "false_accept_delta_max": 0.02,
+      "eer_delta_max": 1e-6
+    },
+    "tier3_observational": {
+      "robustness_variant_acc_drop_warn": 0.10,
+      "perf_p95_ratio_warn": 1.5,
+      "perf_p95_abs_ms_warn": 5.0,
+      "peak_mem_ratio_warn": 2.0
+    }
+  },
   "case_rules": {
     "probe": "from a chapter the enrollment did not use whenever the speaker has one; single-chapter speakers are marked probe_session=same",
-    "verify": "balanced: one genuine and one impostor trial per speaker; this is the primary metric",
-    "verify_impostor": "every other speaker of the split claims the name; measures false accepts only",
-    "verify_short / verify_noise": "one genuine and one impostor trial per speaker",
+    "verify": "balanced: one genuine and one impostor trial per speaker; this is the primary accuracy metric",
+    "verify_impostor": "every other speaker of the split claims the name; combined with verify for verify_all EER/minDCF",
+    "robustness_noise": "white, pink, and babble noise at SNR 20/10/5/0 dB (12 conditions x 40 trials); babble excludes trial target and impostor",
+    "robustness_duration": "clipped durations 1.0/1.5/3.0/5.0 s (4 conditions x 40 trials)",
+    "robustness_channel": "8 kHz G.711 mu-law telephone channel (1 condition x 40 trials)",
+    "robustness_reverb": "exponential RIR at RT60 0.3/0.6 s (2 conditions x 40 trials)",
+    "robustness_mixture": "5 two-speaker 8 kHz 0 dB mixtures evaluated via 分离再辨认",
     "uncertain": "never counted as a correct automatic decision, in identification as in verification"
   }
 }
