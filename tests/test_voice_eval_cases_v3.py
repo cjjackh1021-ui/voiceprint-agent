@@ -287,7 +287,14 @@ class SynthAndCasesV3Tests(unittest.TestCase):
             loaded_a = load('validation', case_dir=case_dir)
             loaded_b = load('validation', case_dir=case_dir_b)
             self.assertEqual([c['id'] for c in loaded_a], [c['id'] for c in loaded_b])
-            for suite_pick in ('robustness_noise', 'robustness_channel', 'robustness_reverb', 'robustness_mixture'):
+            self.assertEqual([c['hidden'] for c in loaded_a], [c['hidden'] for c in loaded_b])
+            for suite_pick in (
+                'robustness_noise',
+                'robustness_duration',
+                'robustness_channel',
+                'robustness_reverb',
+                'robustness_mixture',
+            ):
                 ca = next(c for c in loaded_a if c['suite'] == suite_pick)
                 cb = next(c for c in loaded_b if c['suite'] == suite_pick)
                 pa = shlex.split(ca['steps'][-1], posix=True)[-1]

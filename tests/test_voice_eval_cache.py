@@ -66,6 +66,7 @@ class CacheTests(unittest.TestCase):
                 self.assertEqual(
                     cached1.stats(),
                     {
+                        'enabled': True,
                         'hits': 0,
                         'misses': 0,
                         'total': 0,
@@ -144,6 +145,9 @@ class CacheTests(unittest.TestCase):
                 np.savez(tmp_npz, emb=baseline)
                 tmp_npz.replace(p)
 
+            def _write_truncated_npz(p: Path):
+                p.write_bytes(b'PK\x03\x04\x14\x00trunc')
+
             def _write_pickle_obj(p: Path):
                 np.save(p, np.array([{'bad': True}], dtype=object), allow_pickle=True)
 
@@ -155,6 +159,7 @@ class CacheTests(unittest.TestCase):
                 ('wrong_dtype', _write_wrong_dtype),
                 ('nan', _write_nan),
                 ('npz_as_npy', _write_npz_as_npy),
+                ('truncated_npz', _write_truncated_npz),
                 ('pickle_obj', _write_pickle_obj),
             ]
 
@@ -201,6 +206,7 @@ class CacheTests(unittest.TestCase):
 
             np.testing.assert_array_equal(v1, v2)
             stats = disabled.stats()
+            self.assertFalse(stats['enabled'])
             self.assertEqual(stats['misses'], 2)
             self.assertEqual(stats['hits'], 0)
             self.assertEqual(stats['total'], 2)
@@ -244,6 +250,27 @@ class CacheTests(unittest.TestCase):
                 np.testing.assert_array_equal(v0_disk, v0)
                 self.assertEqual(cached.stats()['hits'], 1)
                 self.assertEqual(cached.stats()['misses'], 3)
+
+    def test_none_model_id_and_non_finite_embedding_error_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_dir = root / 'cache'
+            wav_path = generate_speaker_wav(root / 'spk_nf.wav', speaker_index=0, duration=1.5)
+            tone = ToneEmbedder()
+            tone.model_id = None
+            cached = CachedEmbedder(tone, cache_dir=cache_dir)
+            vec = cached.embed_file(str(wav_path))
+            self.assertEqual(vec.shape, (tone.dim,))
+            digest = file_digest(str(wav_path))
+            self.assertTrue((cache_dir / tone.name / 'unknown' / f'{digest}.npy').is_file())
+
+            bad_vec = np.zeros(tone.dim, dtype=np.float32)
+            bad_vec[0] = np.nan
+            disabled = CachedEmbedder(tone, cache_dir=cache_dir, enabled=False)
+            with patch.object(tone, 'embed_file', return_value=bad_vec):
+                with self.assertRaises(ValueError) as ctx:
+                    disabled.embed_file(str(wav_path))
+            self.assertIn('non-finite', str(ctx.exception))
 
 
 if __name__ == '__main__':

@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None):
         cand_ref = args.cand if args.cand is not None else 'vpnet'
         if args.split is not None:
             eff_split = args.split
-        elif Path(base_ref).is_dir() or (REPORTS / str(base_ref)).is_dir():
+        elif Path(base_ref).exists() or (REPORTS / str(base_ref)).exists():
             eff_split = None
         else:
             eff_split = 'validation'

@@ -47,10 +47,19 @@ def _windows_rss_mb() -> float | None:
                 ('PeakPagefileUsage', ctypes.c_size_t),
             ]
 
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        psapi = ctypes.WinDLL('psapi', use_last_error=True)
+        get_current_process = kernel32.GetCurrentProcess
+        get_current_process.argtypes = []
+        get_current_process.restype = wintypes.HANDLE
+        get_memory_info = psapi.GetProcessMemoryInfo
+        get_memory_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ProcessMemoryCounters), wintypes.DWORD]
+        get_memory_info.restype = wintypes.BOOL
+
         counters = _ProcessMemoryCounters()
         counters.cb = ctypes.sizeof(counters)
-        handle = ctypes.windll.kernel32.GetCurrentProcess()
-        ok = ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
+        handle = get_current_process()
+        ok = get_memory_info(handle, ctypes.byref(counters), counters.cb)
         if not ok:
             return None
         return float(counters.WorkingSetSize) / (1024.0 * 1024.0)
@@ -97,7 +106,7 @@ def summarize_perf(
         total = int(cache_stats.get('total', hits + misses))
         hit_rate = float(cache_stats.get('hit_rate', (hits / total) if total else 0.0))
         cache_summary = {
-            'enabled': True,
+            'enabled': bool(cache_stats.get('enabled', True)),
             'hits': hits,
             'misses': misses,
             'total': total,

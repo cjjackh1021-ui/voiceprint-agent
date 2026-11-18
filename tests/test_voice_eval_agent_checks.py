@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from agent.service import VoiceAgent
 from tests._helpers import patched_dpapi
-from voice_eval.dims._sandbox import generate_speaker_wav
+from voice_eval.dims._sandbox import deterministic_separator, generate_speaker_wav
 from voice_eval.dims.flow import evaluate_flow
 from voice_eval.dims.response import check_reply_payload, evaluate_response
 from voice_eval.dims.tooling import evaluate_tooling
@@ -126,21 +126,38 @@ class AgentDimensionChecksTests(unittest.TestCase):
         self.assertFalse(ok_key, msg_key)
 
         # Negative test 4: > 16 embedding list leak in result (both detail=False and detail=True)
+        # including numpy scalar lists (np.float32 / np.int64) and scientific notation string vectors.
+        import numpy as np
+
         for detail_flag in (False, True):
-            ok_vec, msg_vec = check_reply_payload(
+            for bad_vec in ([0.1] * 17, [np.float32(0.1) for _ in range(32)], [np.int64(1) for _ in range(32)]):
+                ok_vec, msg_vec = check_reply_payload(
+                    {
+                        'tool': 'verify',
+                        'ok': True,
+                        'result': {'decision': 'accept', 'score': 2.0, 'embedding': bad_vec}
+                        if detail_flag
+                        else {'decision': 'accept', 'embedding': bad_vec},
+                        'reply': 'alice：结论：接受。',
+                    },
+                    expect_decision='accept',
+                    detail=detail_flag,
+                    speaker_name='alice',
+                )
+                self.assertFalse(ok_vec, f'failed to catch >16 vector leak for detail={detail_flag}: {msg_vec}')
+
+            ok_sci, msg_sci = check_reply_payload(
                 {
                     'tool': 'verify',
                     'ok': True,
-                    'result': {'decision': 'accept', 'score': 2.0, 'embedding': [0.1] * 17}
-                    if detail_flag
-                    else {'decision': 'accept', 'embedding': [0.1] * 17},
-                    'reply': 'alice：结论：接受。',
+                    'result': {'decision': 'accept', 'score': 2.0} if detail_flag else {'decision': 'accept'},
+                    'reply': 'alice：结论：接受。[0.1e-3, 1.2E+02, -3.4e5, 5e-2, 0.9]',
                 },
                 expect_decision='accept',
                 detail=detail_flag,
                 speaker_name='alice',
             )
-            self.assertFalse(ok_vec, f'failed to catch >16 vector leak for detail={detail_flag}: {msg_vec}')
+            self.assertFalse(ok_sci, f'failed to catch scientific notation vector for detail={detail_flag}: {msg_sci}')
 
         # Negative test 5: split-winner lookalike with numeric score/threshold leak must still be caught
         for bad_reply in (
@@ -219,10 +236,17 @@ class AgentDimensionChecksTests(unittest.TestCase):
             return out
 
         with patched_dpapi(), patch.object(VoiceAgent, 'handle', broken_handle):
-            res = evaluate_flow(separator=lambda src, d: {'sample_rate': 8000, 'paths': [src, src], 'checkpoint': 'm'})
+            res = evaluate_flow(separator=deterministic_separator)
         self.assertFalse(res['passed'])
         failed = [c for c in res['checks'] if not c['passed']]
-        self.assertTrue(any('revoke' in c['id'] for c in failed), failed)
+        self.assertEqual([c['id'] for c in failed], ['revoke_confirm_and_interrupts'])
+
+    def test_evaluate_flow_catches_bad_custom_separator_speaker_names(self):
+        with patched_dpapi():
+            res = evaluate_flow(separator=lambda src, _d: {'sample_rate': 8000, 'paths': [src, src], 'checkpoint': 'm'})
+        self.assertFalse(res['passed'])
+        failed = [c for c in res['checks'] if not c['passed']]
+        self.assertEqual([c['id'] for c in failed], ['separate_and_identify_flow'])
 
 
 class SecurityAndRobustnessAgentChecksTests(unittest.TestCase):
@@ -238,7 +262,9 @@ class SecurityAndRobustnessAgentChecksTests(unittest.TestCase):
         self.assertEqual(res['green'], res['total_executed'])
         self.assertGreaterEqual(res['total_executed'], 18)
 
-        ids = {c['id'] for c in res['checks']}
+        by_id = {c['id']: c for c in res['checks']}
+        self.assertIn('consent check', by_id['enroll_missing_consent']['detail'])
+        ids = set(by_id)
         for required in (
             'export_zh_vector',
             'export_zh_raw',

@@ -73,16 +73,16 @@ class GuardrailTests(unittest.TestCase):
 
                 w0, sr = sf.read(str(genuine), dtype='float32')
                 w1, _ = sf.read(str(impostor), dtype='float32')
-                uncertain_path = root / 'uncertain.wav'
-                found_uncertain = False
-                for alpha in np.linspace(0.0, 1.0, 101):
+                uncertain_path = None
+                for idx, alpha in enumerate(np.linspace(0.0, 1.0, 101)):
+                    candidate = root / f'uncertain_{idx:02d}.wav'
                     blend = ((1.0 - alpha) * w0 + alpha * w1).astype(np.float32)
-                    sf.write(str(uncertain_path), blend, sr)
-                    probe_res = detail_agent.handle(f'验证 alice "{uncertain_path}"')
+                    sf.write(str(candidate), blend, sr)
+                    probe_res = detail_agent.handle(f'验证 alice "{candidate}"')
                     if probe_res['result'].get('decision') == 'uncertain':
-                        found_uncertain = True
+                        uncertain_path = candidate
                         break
-                self.assertTrue(found_uncertain, 'failed to synthesize a deterministic uncertain probe')
+                self.assertIsNotNone(uncertain_path, 'failed to synthesize a deterministic uncertain probe')
 
                 for probe_path, expect in ((genuine, 'accept'), (impostor, 'reject'), (uncertain_path, 'uncertain')):
                     out = quiet_agent.handle(f'验证 alice "{probe_path}"')

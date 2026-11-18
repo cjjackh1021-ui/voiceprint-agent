@@ -1,5 +1,7 @@
 """Deterministic sandbox embedder, harmonic speaker synthesis, and hermetic cohort helpers."""
+import functools
 import hashlib
+from collections.abc import Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -38,14 +40,10 @@ def _orthogonal_projection(seed: int, dim: int) -> np.ndarray:
 
 
 _PROJ = _orthogonal_projection(2026, DIM)
-_FILTER_CACHE: dict[tuple[int, int], np.ndarray] = {}
 
 
+@functools.lru_cache(maxsize=8)
 def _log_filters(n_freqs: int, sr: int = SR) -> np.ndarray:
-    key = (n_freqs, sr)
-    cached = _FILTER_CACHE.get(key)
-    if cached is not None:
-        return cached
     edges = np.geomspace(_FMIN, min(_FMAX, 0.48 * sr), DIM + 2)
     freqs = np.fft.rfftfreq((n_freqs - 1) * 2, d=1.0 / sr)
     fb = np.zeros((DIM, n_freqs), dtype=np.float64)
@@ -59,7 +57,7 @@ def _log_filters(n_freqs: int, sr: int = SR) -> np.ndarray:
             fb[m - 1, int(np.argmin(np.abs(freqs - mid)))] = 1.0
         else:
             fb[m - 1] = weights / area
-    _FILTER_CACHE[key] = fb
+    fb.setflags(write=False)
     return fb
 
 
@@ -176,3 +174,48 @@ def sandbox_cohort(embedder: Embedder, n: int = 16):
 
     with patch.object(service_mod, 'cohort_matrix', _fake_cohort_matrix):
         yield
+
+
+def quote_paths(paths: Sequence[str | Path]) -> str:
+    """Quote file paths as POSIX strings safe for shlex(posix=True) across platforms."""
+    return ' '.join(f'"{p.as_posix() if isinstance(p, Path) else p}"' for p in paths)
+
+
+def sandbox_enroll_takes(
+    base_dir: Path,
+    name: str,
+    speaker_index: int,
+    *,
+    duration: float = 4.0,
+) -> list[Path]:
+    """Synthesize 3 deterministic cross-folder enrollment takes for a sandbox speaker."""
+    return [
+        generate_speaker_wav(base_dir / 's1' / f'{name}_0.wav', speaker_index, duration=duration, phase=0.0, seed=0),
+        generate_speaker_wav(base_dir / 's1' / f'{name}_1.wav', speaker_index, duration=duration, phase=0.8, seed=1),
+        generate_speaker_wav(base_dir / 's2' / f'{name}_2.wav', speaker_index, duration=duration, phase=1.6, seed=2),
+    ]
+
+
+def sandbox_enroll(
+    agent,
+    name: str,
+    base_dir: Path,
+    speaker_index: int,
+    *,
+    duration: float = 4.0,
+) -> list[Path]:
+    """Generate 3 enrollment takes, handle '注册 ... 本人同意 ...', and assert success."""
+    takes = sandbox_enroll_takes(base_dir, name, speaker_index, duration=duration)
+    out = agent.handle(f'注册 {name} 本人同意 {quote_paths(takes)}')
+    if not out.get('ok'):
+        raise RuntimeError(f'sandbox enrollment failed for {name}: {out}')
+    return takes
+
+
+def deterministic_separator(src: str, dest_dir: Path) -> dict:
+    """Deterministic two-speaker splitter returning synthetic speaker-0 and speaker-1 waveforms."""
+    _ = src
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    p1 = generate_speaker_wav(dest_dir / 'det_spk1.wav', speaker_index=0, duration=2.0, phase=2.0, seed=11)
+    p2 = generate_speaker_wav(dest_dir / 'det_spk2.wav', speaker_index=1, duration=2.0, phase=2.0, seed=12)
+    return {'sample_rate': 8000, 'paths': [str(p1), str(p2)], 'checkpoint': 'deterministic'}

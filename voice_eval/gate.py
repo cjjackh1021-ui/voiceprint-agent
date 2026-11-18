@@ -157,6 +157,10 @@ def _evaluate_tier3_warnings(base_summary: dict, cand_summary: dict) -> tuple[li
     agree_rate = consistency.get('agreement_rate')
     if agree_rate is not None and float(agree_rate) < 1.0:
         warnings.append(f'重复一致性告警：多次重复运行判决一致率为 {float(agree_rate):.3f}（低于 1.000）。')
+    elif consistency.get('passed') is False:
+        spread = consistency.get('max_score_spread')
+        spread_str = 'N/A' if spread is None else f'{float(spread):.6f}'
+        warnings.append(f'重复一致性告警：多次重复运行分数存在漂移（max_score_spread={spread_str}）。')
 
     return warnings, worst_drop
 

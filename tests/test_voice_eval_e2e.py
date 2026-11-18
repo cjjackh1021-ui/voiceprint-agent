@@ -357,6 +357,18 @@ class EndToEndEvalTests(unittest.TestCase):
                 self.assertFalse(leak_summary['dimensions']['response']['passed'])
                 self.assertGreaterEqual(leak_summary['dimensions']['response']['leak_count'], 1)
 
+                # use_cache=False must bypass cache and report cache.enabled=False in summary.json.
+                no_cache_dir = root / 'nocache_reports'
+                no_cache_out = run_split(
+                    ToneEmbedder(), 'validation', False,
+                    case_dir=mini_case_dir, reports_dir=no_cache_dir, cache_dir=cache_dir,
+                    use_cache=False, skip_mixture=True,
+                )
+                no_cache_summary = json.loads((no_cache_out / 'summary.json').read_text(encoding='utf-8'))
+                self.assertFalse(no_cache_summary['dimensions']['perf']['cache']['enabled'])
+                self.assertEqual(no_cache_summary['dimensions']['perf']['cache']['hits'], 0)
+                self.assertGreater(no_cache_summary['dimensions']['perf']['cache']['misses'], 0)
+
                 # CLI compare default invocation (stats vs vpnet -> writes both canonical and legacy names).
                 weak_mini = run_split(
                     WeakEmbedder(), 'validation', True,
@@ -394,6 +406,19 @@ class EndToEndEvalTests(unittest.TestCase):
                     locked_json = json.loads((cli_reports / 'compare_stats_vs_vpnet_locked.json').read_text(encoding='utf-8'))
                     self.assertEqual(locked_json['split'], 'locked')
                     self.assertFalse(locked_json['adopt'])
+
+                    # File paths (summary.json / cases.jsonl) passed without --split auto-detect locked split cleanly.
+                    out_file_cmp = root / 'file_cmp_out'
+                    with redirect_stdout(io.StringIO()):
+                        cli_mod.main([
+                            'compare',
+                            '--base', str(cli_reports / 'stats_locked' / 'summary.json'),
+                            '--cand', str(cli_reports / 'vpnet_locked' / 'cases.jsonl'),
+                            '--out', str(out_file_cmp),
+                        ])
+                    file_cmp_json = json.loads((out_file_cmp / 'compare_stats_vs_vpnet_locked.json').read_text(encoding='utf-8'))
+                    self.assertEqual(file_cmp_json['split'], 'locked')
+                    self.assertFalse(file_cmp_json['adopt'])
 
                 # Verify CLI run supports --no-cache and --skip-mixture flags.
                 with patch.object(cli_mod, 'run_all', return_value={'ok': True, 'errors': []}), \

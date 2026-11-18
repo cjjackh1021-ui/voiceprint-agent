@@ -7,20 +7,14 @@ import numpy as np
 import soundfile as sf
 
 from agent.service import VoiceAgent
-from voice_eval.dims._sandbox import ToneEmbedder, generate_speaker_wav, sandbox_cohort
+from voice_eval.dims._sandbox import (
+    ToneEmbedder,
+    deterministic_separator,
+    generate_speaker_wav,
+    sandbox_cohort,
+    sandbox_enroll,
+)
 from voiceprint.separate import CKPT as SEPARATE_CKPT
-
-
-def _enroll(agent: VoiceAgent, name: str, base_dir: Path, speaker_index: int) -> list[Path]:
-    takes = [
-        generate_speaker_wav(base_dir / 's1' / f'{name}_0.wav', speaker_index, duration=4.0, phase=0.0, seed=0),
-        generate_speaker_wav(base_dir / 's1' / f'{name}_1.wav', speaker_index, duration=4.0, phase=0.8, seed=1),
-        generate_speaker_wav(base_dir / 's2' / f'{name}_2.wav', speaker_index, duration=4.0, phase=1.6, seed=2),
-    ]
-    out = agent.handle(f'注册 {name} 本人同意 ' + ' '.join(f'"{p}"' for p in takes))
-    if not out['ok']:
-        raise RuntimeError(f'flow setup enrollment failed for {name}: {out}')
-    return takes
 
 
 class _AltToneEmbedder(ToneEmbedder):
@@ -32,7 +26,7 @@ def _flow_revoke_confirm(embedder: ToneEmbedder) -> tuple[bool, str]:
         root = Path(tmp)
         agent = VoiceAgent(root / 'db', embedder, detail=True, audio_roots=[root])
         try:
-            _enroll(agent, 'alice', root / 'audio', 0)
+            sandbox_enroll(agent, 'alice', root / 'audio', 0)
             probe = generate_speaker_wav(root / 'probe.wav', 0, duration=4.0, phase=2.4, seed=3)
             for interrupt in ('名单', '帮助', '退出', '未知指令', f'验证 alice "{probe}"'):
                 ask = agent.handle('撤销 alice')
@@ -67,7 +61,7 @@ def _flow_lockout_and_reset(embedder: ToneEmbedder) -> tuple[bool, str]:
 
         agent_a = VoiceAgent(root / 'db_a', embedder, detail=True, audio_roots=[root])
         try:
-            _enroll(agent_a, 'alice', root / 'audio_a', 0)
+            sandbox_enroll(agent_a, 'alice', root / 'audio_a', 0)
             for idx in range(5):
                 res = agent_a.handle(f'验证 alice "{impostor}"')
                 if (res.get('result') or {}).get('decision') != 'reject':
@@ -80,7 +74,7 @@ def _flow_lockout_and_reset(embedder: ToneEmbedder) -> tuple[bool, str]:
 
         agent_b = VoiceAgent(root / 'db_b', embedder, detail=True, audio_roots=[root])
         try:
-            _enroll(agent_b, 'alice', root / 'audio_b', 0)
+            sandbox_enroll(agent_b, 'alice', root / 'audio_b', 0)
             for _ in range(4):
                 agent_b.handle(f'验证 alice "{impostor}"')
             mid_ok = agent_b.handle(f'验证 alice "{genuine}"')
@@ -154,7 +148,7 @@ def _flow_key_rotation(embedder: ToneEmbedder) -> tuple[bool, str]:
         root = Path(tmp)
         agent = VoiceAgent(root / 'db', embedder, detail=True, audio_roots=[root])
         try:
-            _enroll(agent, 'alice', root / 'audio', 0)
+            sandbox_enroll(agent, 'alice', root / 'audio', 0)
             probe = generate_speaker_wav(root / 'probe.wav', 0, duration=4.0, phase=2.4, seed=3)
             first = agent.handle(f'验证 alice "{probe}"')
             seed_before, seg_before = agent.store.load_speaker('alice', *agent.model)
@@ -181,7 +175,7 @@ def _flow_drift_detection(embedder: ToneEmbedder) -> tuple[bool, str]:
 
         agent_ok = VoiceAgent(root / 'db_ok', embedder, detail=True, audio_roots=[root])
         try:
-            _enroll(agent_ok, 'alice', root / 'audio_ok', 0)
+            sandbox_enroll(agent_ok, 'alice', root / 'audio_ok', 0)
             insufficient = agent_ok.handle('漂移 alice')
             if not insufficient['ok'] or insufficient['result'].get('n', -1) != 0 or '记录不足' not in insufficient['reply']:
                 return False, f'expected insufficient drift message: {insufficient}'
@@ -195,7 +189,7 @@ def _flow_drift_detection(embedder: ToneEmbedder) -> tuple[bool, str]:
 
         agent_drop = VoiceAgent(root / 'db_drop', embedder, detail=True, audio_roots=[root])
         try:
-            _enroll(agent_drop, 'alice', root / 'audio_drop', 0)
+            sandbox_enroll(agent_drop, 'alice', root / 'audio_drop', 0)
             agent_drop.handle(f'验证 alice "{p1}"')
             agent_drop.handle(f'验证 alice "{p2}"')
             agent_drop.handle(f'验证 alice "{imp}"')
@@ -216,7 +210,7 @@ def _flow_cross_model_isolation(embedder: ToneEmbedder) -> tuple[bool, str]:
 
         agent_a = VoiceAgent(db_dir, embedder, detail=True, audio_roots=[root])
         try:
-            _enroll(agent_a, 'alice', root / 'audio', 0)
+            sandbox_enroll(agent_a, 'alice', root / 'audio', 0)
         finally:
             agent_a.close()
 
@@ -245,8 +239,8 @@ def _run_separate_once(embedder: ToneEmbedder, custom_separator) -> tuple[bool, 
 
         agent = VoiceAgent(root / 'db', embedder, detail=True, audio_roots=[audio_dir])
         try:
-            _enroll(agent, 'alice', audio_dir / 'enroll', 0)
-            _enroll(agent, 'bob', audio_dir / 'enroll', 1)
+            sandbox_enroll(agent, 'alice', audio_dir / 'enroll', 0)
+            sandbox_enroll(agent, 'bob', audio_dir / 'enroll', 1)
             if custom_separator is not None:
                 with patch('voiceprint.separate.separate_file', custom_separator):
                     out = agent.handle(f'分离再辨认 "{mix_path}"')
@@ -267,28 +261,25 @@ def _run_separate_once(embedder: ToneEmbedder, custom_separator) -> tuple[bool, 
             agent.close()
 
 
-def _flow_separate_and_identify(embedder: ToneEmbedder, separator=None) -> tuple[bool, str]:
-    def _deterministic_splitter(_src: str, dest_dir: Path) -> dict:
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        p1 = generate_speaker_wav(dest_dir / 'det_spk1.wav', speaker_index=0, duration=2.0, phase=2.0, seed=11)
-        p2 = generate_speaker_wav(dest_dir / 'det_spk2.wav', speaker_index=1, duration=2.0, phase=2.0, seed=12)
-        return {'sample_rate': 8000, 'paths': [str(p1), str(p2)], 'checkpoint': 'deterministic'}
+def _check_separated_names(embedder: ToneEmbedder, separator) -> tuple[bool, str]:
+    ok, msg, names = _run_separate_once(embedder, separator)
+    if not ok:
+        return False, msg
+    if set(names) != {'alice', 'bob'}:
+        return False, f'expected identified names {{"alice", "bob"}}, got {names}'
+    return True, 'ok'
 
+
+def _flow_separate_and_identify(embedder: ToneEmbedder, separator=None) -> tuple[bool, str]:
     if separator is not None:
-        ok, msg, _names = _run_separate_once(embedder, separator)
-        return ok, msg
+        return _check_separated_names(embedder, separator)
 
     if SEPARATE_CKPT.exists():
         ok_real, msg_real, _ = _run_separate_once(embedder, None)
         if not ok_real:
             return False, f'real Conv-TasNet path failed: {msg_real}'
 
-    ok_det, msg_det, names = _run_separate_once(embedder, _deterministic_splitter)
-    if not ok_det:
-        return False, msg_det
-    if set(names) != {'alice', 'bob'}:
-        return False, f'expected identified names {{"alice", "bob"}}, got {names}'
-    return True, 'ok'
+    return _check_separated_names(embedder, deterministic_separator)
 
 
 def evaluate_flow(separator=None) -> dict:

@@ -97,16 +97,13 @@ def _parts(files: list[str]) -> tuple[list[str], str, str]:
 def _same_folder_short(out_dir: Path, split: str, name: str, source: str) -> list[str]:
     """Three two-second clips in one folder. Enrollment must refuse this."""
     folder = out_dir / 'audio' / split / f'{name}-one-take'
-    folder.mkdir(parents=True, exist_ok=True)
     wav, sr = _read_mono(source)
     paths = []
     for index in range(3):
         piece = wav[index * sr:(index + 2) * sr]
         if piece.shape[0] < sr:
             piece = np.pad(piece, (0, sr - piece.shape[0]))
-        path = folder / f'part{index}.wav'
-        sf.write(path, piece, sr)
-        paths.append(str(path))
+        paths.append(_write_wav(folder / f'part{index}.wav', piece, sr))
     return paths
 
 
@@ -118,6 +115,8 @@ def _sample_babble_interferers(
     snr: int,
 ) -> list[np.ndarray]:
     """Sample up to 3 interferers excluding both probe owner and paired impostor claimant."""
+    # _add_verify_condition pairs claimant names[i] with impostor names[(i + 1) % N],
+    # so `name` serves as the impostor probe for claimant names[(idx - 1) % N].
     idx = names.index(name)
     prev_name = names[(idx - 1) % len(names)]
     pool = [spk for spk in names if spk not in (name, prev_name)]

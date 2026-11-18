@@ -219,6 +219,66 @@ class PerfDimensionTests(unittest.TestCase):
                 patch.object(perf, '_windows_rss_mb', return_value=None):
             self.assertIsNone(perf.current_rss_mb())
 
+    def test_windows_rss_mb_sets_64bit_argtypes_restype_and_reads_working_set(self):
+        import ctypes
+        from ctypes import wintypes
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from voice_eval.dims import perf
+
+        handle_64 = 0x00000123456789AB
+        observed = {}
+
+        def fake_get_current_process():
+            return handle_64
+
+        def fake_get_process_memory_info(handle, counters_ref, cb):
+            observed['handle'] = handle
+            observed['cb'] = cb
+            counters_ref._obj.WorkingSetSize = 64 * 1024 * 1024
+            return 1
+
+        kernel32 = SimpleNamespace(GetCurrentProcess=fake_get_current_process)
+        psapi = SimpleNamespace(GetProcessMemoryInfo=fake_get_process_memory_info)
+        dll_calls = []
+
+        def fake_windll(name, use_last_error=False):
+            dll_calls.append((name, use_last_error))
+            if name == 'kernel32':
+                return kernel32
+            if name == 'psapi':
+                return psapi
+            raise AssertionError(f'unexpected DLL {name!r}')
+
+        with patch.object(perf, 'resource', None), patch.object(perf.sys, 'platform', 'win32'), \
+                patch.object(perf.ctypes, 'WinDLL', side_effect=fake_windll, create=True):
+            rss = perf.current_rss_mb()
+
+        self.assertAlmostEqual(rss, 64.0, places=6)
+        self.assertEqual(dll_calls, [('kernel32', True), ('psapi', True)])
+        self.assertEqual(kernel32.GetCurrentProcess.argtypes, [])
+        self.assertIs(kernel32.GetCurrentProcess.restype, wintypes.HANDLE)
+        argtypes = psapi.GetProcessMemoryInfo.argtypes
+        self.assertEqual(len(argtypes), 3)
+        self.assertIs(argtypes[0], wintypes.HANDLE)
+        self.assertTrue(issubclass(argtypes[1], ctypes._Pointer))
+        self.assertEqual(argtypes[1]._type_.__name__, '_ProcessMemoryCounters')
+        self.assertIs(argtypes[2], wintypes.DWORD)
+        self.assertIs(psapi.GetProcessMemoryInfo.restype, wintypes.BOOL)
+        self.assertEqual(observed['handle'], handle_64)
+        self.assertGreater(observed['cb'], 0)
+
+        psapi_fail = SimpleNamespace(GetProcessMemoryInfo=lambda _h, _c, _cb: 0)
+        with patch.object(perf, 'resource', None), patch.object(perf.sys, 'platform', 'win32'), \
+                patch.object(
+                    perf.ctypes,
+                    'WinDLL',
+                    side_effect=lambda name, use_last_error=False: kernel32 if name == 'kernel32' else psapi_fail,
+                    create=True,
+                ):
+            self.assertIsNone(perf.current_rss_mb())
+
     def test_summarize_perf_includes_case_steps_embed_compute_and_memory(self):
         from voice_eval.dims.perf import summarize_perf
 
@@ -255,6 +315,37 @@ class PerfDimensionTests(unittest.TestCase):
         self.assertFalse(no_cache['cache']['enabled'])
         self.assertEqual(no_cache['embed_compute']['n'], 0)
         self.assertIsNone(no_cache['rss_mb'])
+
+        disabled_stats = summarize_perf(
+            [5.0],
+            {},
+            {
+                'enabled': False,
+                'hits': 0,
+                'misses': 2,
+                'total': 2,
+                'hit_rate': 0.0,
+                'compute_ms_list': [1.0, 2.0],
+                'lookup_ms_list': [],
+            },
+            1.0,
+            None,
+        )
+        self.assertFalse(disabled_stats['cache']['enabled'])
+        self.assertEqual(disabled_stats['cache']['misses'], 2)
+
+    def test_sandbox_log_filters_lru_bounded_and_readonly(self):
+        from voice_eval.dims._sandbox import _log_filters
+
+        _log_filters.cache_clear()
+        self.assertEqual(_log_filters.cache_info().maxsize, 8)
+        fb = _log_filters(257, 16000)
+        self.assertFalse(fb.flags.writeable)
+        with self.assertRaises(ValueError):
+            fb[0, 0] = 1.0
+        for k in range(12):
+            _log_filters(128 + k, 16000)
+        self.assertLessEqual(_log_filters.cache_info().currsize, 8)
 
 
 class RobustnessDimensionTests(unittest.TestCase):
@@ -346,6 +437,29 @@ class AuditUpgradeTests(unittest.TestCase):
                     bad_proto_res = audit.run_all()
             self.assertFalse(bad_proto_res['ok'])
             self.assertTrue(bad_proto_res['errors'])
+
+
+class GateTier3Tests(unittest.TestCase):
+    def test_consistency_score_drift_emits_tier3_warning_even_when_agreement_is_one(self):
+        from voice_eval.gate import _evaluate_tier3_warnings
+
+        base_summary = {'dimensions': {'perf': {}, 'robustness': {}}}
+        cand_summary = {
+            'dimensions': {
+                'perf': {},
+                'robustness': {
+                    'fault_recovery': {'recovery_rate': 1.0},
+                    'consistency': {
+                        'passed': False,
+                        'agreement_rate': 1.0,
+                        'max_score_spread': 0.025,
+                    },
+                },
+            }
+        }
+        warnings, _ = _evaluate_tier3_warnings(base_summary, cand_summary)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn('0.025', warnings[0])
 
 
 if __name__ == '__main__':

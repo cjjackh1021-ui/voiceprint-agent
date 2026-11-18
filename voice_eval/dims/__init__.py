@@ -1,7 +1,5 @@
 """Multi-dimensional offline evaluation modules for voiceprint-agent."""
-from pathlib import Path
-
-from voice_eval.dims._sandbox import generate_speaker_wav
+from voice_eval.dims._sandbox import deterministic_separator
 from voice_eval.dims.flow import evaluate_flow
 from voice_eval.dims.perf import summarize_perf
 from voice_eval.dims.redteam import evaluate_redteam
@@ -11,14 +9,6 @@ from voice_eval.dims.task import evaluate_task
 from voice_eval.dims.tooling import evaluate_tooling
 
 __all__ = ['evaluate_all_dimensions']
-
-
-def _fast_flow_separator(_src: str, dest_dir: Path) -> dict:
-    """Deterministic two-speaker splitter used when heavy Conv-TasNet flow execution is skipped."""
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    p1 = generate_speaker_wav(dest_dir / 'det_spk1.wav', speaker_index=0, duration=2.0, phase=2.0, seed=11)
-    p2 = generate_speaker_wav(dest_dir / 'det_spk2.wav', speaker_index=1, duration=2.0, phase=2.0, seed=12)
-    return {'sample_rate': 8000, 'paths': [str(p1), str(p2)], 'checkpoint': 'deterministic'}
 
 
 def evaluate_all_dimensions(
@@ -33,7 +23,7 @@ def evaluate_all_dimensions(
     task_res = evaluate_task(rows)
     tooling_res = evaluate_tooling()
     response_res = evaluate_response(real_non_detail_checks=real_non_detail_checks)
-    flow_res = evaluate_flow(separator=_fast_flow_separator if skip_flow_separate else None)
+    flow_res = evaluate_flow(separator=deterministic_separator if skip_flow_separate else None)
 
     if 'case' in perf_data and 'cache' in perf_data and 'embed_compute' in perf_data:
         perf_res = dict(perf_data)

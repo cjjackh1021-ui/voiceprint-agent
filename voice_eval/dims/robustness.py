@@ -5,19 +5,18 @@ from tempfile import TemporaryDirectory
 import numpy as np
 
 from agent.service import VoiceAgent
-from voice_eval.dims._sandbox import ToneEmbedder, generate_speaker_wav, sandbox_cohort
+from voice_eval.dims._sandbox import (
+    ToneEmbedder,
+    generate_speaker_wav,
+    quote_paths,
+    sandbox_cohort,
+    sandbox_enroll,
+    sandbox_enroll_takes,
+)
 from voice_eval.dims.task import summarize_verify_group
 from voice_eval.grader import aggregate
 
 STANDARD_AXES = ('noise', 'duration', 'channel', 'reverb', 'mixture')
-
-
-def _enroll_takes(base_dir: Path, name: str, speaker_index: int) -> list[Path]:
-    return [
-        generate_speaker_wav(base_dir / 's1' / f'{name}_0.wav', speaker_index, duration=4.0, phase=0.0, seed=0),
-        generate_speaker_wav(base_dir / 's1' / f'{name}_1.wav', speaker_index, duration=4.0, phase=0.8, seed=1),
-        generate_speaker_wav(base_dir / 's2' / f'{name}_2.wav', speaker_index, duration=4.0, phase=1.6, seed=2),
-    ]
 
 
 def evaluate_fault_recovery() -> dict:
@@ -30,7 +29,6 @@ def evaluate_fault_recovery() -> dict:
         audio_dir = root / 'audio'
         audio_dir.mkdir(parents=True, exist_ok=True)
 
-        takes = _enroll_takes(audio_dir, 'alice', speaker_index=0)
         genuine_probe = generate_speaker_wav(audio_dir / 'genuine.wav', speaker_index=0, duration=4.0, phase=2.4, seed=3)
 
         fake_txt = audio_dir / 'not_audio.txt'
@@ -47,9 +45,7 @@ def evaluate_fault_recovery() -> dict:
 
         agent = VoiceAgent(root / 'db', embedder, detail=True, audio_roots=[audio_dir])
         try:
-            enrolled = agent.handle('注册 alice 本人同意 ' + ' '.join(f'"{p}"' for p in takes))
-            if not enrolled['ok']:
-                raise RuntimeError(f'fault recovery setup failed: {enrolled}')
+            sandbox_enroll(agent, 'alice', audio_dir, 0)
             seed_orig, seg_orig = agent.store.load_speaker('alice', *agent.model)
 
             for fault_id, fault_cmd in faults:
@@ -104,7 +100,7 @@ def evaluate_consistency(repeats: int = 3) -> dict:
     with sandbox_cohort(embedder), TemporaryDirectory(prefix='vprob_cons_') as tmp:
         root = Path(tmp)
         audio_dir = root / 'audio'
-        takes = {idx: _enroll_takes(audio_dir, f'spk_{idx}', idx) for idx in (0, 1, 2)}
+        takes = {idx: sandbox_enroll_takes(audio_dir, f'spk_{idx}', idx) for idx in (0, 1, 2)}
         probes = {
             idx: generate_speaker_wav(audio_dir / f'probe_{idx}.wav', speaker_index=idx, duration=4.0, phase=2.4, seed=3)
             for idx in (0, 1, 2)
@@ -121,7 +117,7 @@ def evaluate_consistency(repeats: int = 3) -> dict:
         for trial_id, enroll_paths, probe_path, expect_decision in trials:
             decisions: list[str] = []
             scores: list[float] = []
-            enroll_cmd = '注册 target 本人同意 ' + ' '.join(f'"{p}"' for p in enroll_paths)
+            enroll_cmd = f'注册 target 本人同意 {quote_paths(enroll_paths)}'
             verify_cmd = f'验证 target "{probe_path}"'
 
             for rep in range(repeats):

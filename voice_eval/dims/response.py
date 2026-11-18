@@ -1,4 +1,5 @@
 """Dimension 3: reply-decision consistency, detail=False score-leak guards, and vector-export protection."""
+import numbers
 import re
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -7,11 +8,11 @@ import numpy as np
 import soundfile as sf
 
 from agent.service import VoiceAgent
-from voice_eval.dims._sandbox import ToneEmbedder, generate_speaker_wav, sandbox_cohort
+from voice_eval.dims._sandbox import ToneEmbedder, generate_speaker_wav, sandbox_cohort, sandbox_enroll
 
 FORBIDDEN_NON_DETAIL_KEYS = frozenset({'score', 'raw_score', 'threshold', 'theta_deg', 'low', 'high', 'gap'})
 FORBIDDEN_NON_DETAIL_TERMS = ('归一化相似度', '原始余弦', '夹角', '验证阈值', '相差')
-_VECTOR_SEQ_RE = re.compile(r'\[(?:\s*-?\d+(?:\.\d+)?\s*,){4,}')
+_VECTOR_SEQ_RE = re.compile(r'\[(?:\s*-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\s*,){4,}')
 _FLOAT_RE = re.compile(r'-?\d+\.\d+')
 _NUMERIC_THRESHOLD_RE = re.compile(r'阈值\s*[:：=]?\s*-?\d+(?:\.\d+)?')
 _SPLIT_WINNER_REPLY_RE = re.compile(
@@ -25,7 +26,7 @@ def _contains_large_numeric_vector(obj: object) -> bool:
     if isinstance(obj, dict):
         return any(_contains_large_numeric_vector(val) for val in obj.values())
     if isinstance(obj, (list, tuple)):
-        numeric_count = sum(1 for item in obj if isinstance(item, (int, float)) and not isinstance(item, bool))
+        numeric_count = sum(1 for item in obj if isinstance(item, numbers.Real) and not isinstance(item, bool))
         if numeric_count > 16:
             return True
         return any(_contains_large_numeric_vector(item) for item in obj)
@@ -143,17 +144,6 @@ def check_reply_payload(
     return passed, reason
 
 
-def _enroll(agent: VoiceAgent, name: str, base_dir: Path, speaker_index: int) -> None:
-    takes = [
-        generate_speaker_wav(base_dir / 's1' / f'{name}_0.wav', speaker_index, duration=4.0, phase=0.0, seed=0),
-        generate_speaker_wav(base_dir / 's1' / f'{name}_1.wav', speaker_index, duration=4.0, phase=0.8, seed=1),
-        generate_speaker_wav(base_dir / 's2' / f'{name}_2.wav', speaker_index, duration=4.0, phase=1.6, seed=2),
-    ]
-    out = agent.handle(f'注册 {name} 本人同意 ' + ' '.join(f'"{p}"' for p in takes))
-    if not out['ok']:
-        raise RuntimeError(f'sandbox enrollment failed for {name}: {out}')
-
-
 def _calibrate_uncertain_blend(
     root: Path,
     embedder: ToneEmbedder,
@@ -177,8 +167,8 @@ def _calibrate_uncertain_blend(
         lo, hi = last_accept, first_reject
         calib = VoiceAgent(root / f'calib_{tag}_{prefix}', embedder, detail=True, audio_roots=[root])
         try:
-            _enroll(calib, 'alice', root / 'calib_audio', 0)
-            _enroll(calib, 'bob', root / 'calib_audio', 1)
+            sandbox_enroll(calib, 'alice', root / 'calib_audio', 0)
+            sandbox_enroll(calib, 'bob', root / 'calib_audio', 1)
             for idx, alpha in enumerate(alphas):
                 candidate = blend_dir / f'{prefix}_{idx:03d}.wav'
                 mixed = ((1.0 - float(alpha)) * sig_a + float(alpha) * sig_b).astype(np.float32)
@@ -246,8 +236,8 @@ def evaluate_response(real_non_detail_checks: list[dict] | None = None) -> dict:
             tag = 'detail' if detail_flag else 'quiet'
             agent = VoiceAgent(root / f'db_{tag}', embedder, detail=detail_flag, audio_roots=[root])
             try:
-                _enroll(agent, 'alice', audio_dir / f'enroll_{tag}', 0)
-                _enroll(agent, 'bob', audio_dir / f'enroll_{tag}', 1)
+                sandbox_enroll(agent, 'alice', audio_dir / f'enroll_{tag}', 0)
+                sandbox_enroll(agent, 'bob', audio_dir / f'enroll_{tag}', 1)
 
                 _record(f'{tag}-verify-accept', agent.handle(f'验证 alice "{alice_probe}"'), 'accept', detail_flag, 'alice')
                 _record(f'{tag}-verify-uncertain', agent.handle(f'验证 alice "{uncertain_verify_wav}"'), 'uncertain', detail_flag, 'alice')

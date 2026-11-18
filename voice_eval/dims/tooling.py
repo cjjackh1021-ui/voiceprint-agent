@@ -6,20 +6,14 @@ import numpy as np
 import soundfile as sf
 
 from agent.service import VoiceAgent
-from voice_eval.dims._sandbox import ToneEmbedder, generate_speaker_wav, sandbox_cohort
+from voice_eval.dims._sandbox import (
+    ToneEmbedder,
+    generate_speaker_wav,
+    quote_paths,
+    sandbox_cohort,
+    sandbox_enroll_takes,
+)
 from voiceprint.separate import CKPT as SEPARATE_CKPT
-
-
-def _enroll_takes(base_dir: Path, name: str, speaker_index: int) -> list[Path]:
-    return [
-        generate_speaker_wav(base_dir / 's1' / f'{name}_0.wav', speaker_index, duration=4.0, phase=0.0, seed=0),
-        generate_speaker_wav(base_dir / 's1' / f'{name}_1.wav', speaker_index, duration=4.0, phase=0.8, seed=1),
-        generate_speaker_wav(base_dir / 's2' / f'{name}_2.wav', speaker_index, duration=4.0, phase=1.6, seed=2),
-    ]
-
-
-def _quote_paths(paths: list[Path]) -> str:
-    return ' '.join(f'"{p}"' for p in paths)
 
 
 def _check_outcome(
@@ -67,9 +61,9 @@ def evaluate_tooling() -> dict:
         audio_dir = root / 'audio'
         audio_dir.mkdir(parents=True, exist_ok=True)
 
-        takes_a = _enroll_takes(audio_dir, 'jia', speaker_index=0)
-        takes_b = _enroll_takes(audio_dir, 'yi', speaker_index=1)
-        takes_c = _enroll_takes(audio_dir, 'bing', speaker_index=2)
+        takes_a = sandbox_enroll_takes(audio_dir, 'jia', speaker_index=0)
+        takes_b = sandbox_enroll_takes(audio_dir, 'yi', speaker_index=1)
+        takes_c = sandbox_enroll_takes(audio_dir, 'bing', speaker_index=2)
 
         probe_a = generate_speaker_wav(audio_dir / 'probe_a.wav', speaker_index=0, duration=4.0, phase=2.4, seed=3)
         probe_a2 = generate_speaker_wav(audio_dir / 'probe_a2.wav', speaker_index=0, duration=4.0, phase=3.1, seed=4)
@@ -89,10 +83,10 @@ def evaluate_tooling() -> dict:
         agent = VoiceAgent(root / 'db', embedder, detail=True, audio_roots=[audio_dir])
         try:
             # 1. Basic commands & synonyms
-            cmd = f'注册 甲 本人同意 {_quote_paths(takes_a)}'
+            cmd = f'注册 甲 本人同意 {quote_paths(takes_a)}'
             _check_outcome(checks, 'enroll_primary', cmd, agent.handle(cmd), expect_tool='enroll', expect_ok=True)
 
-            cmd = f'录入 乙 本人同意 {_quote_paths(takes_b)}'
+            cmd = f'录入 乙 本人同意 {quote_paths(takes_b)}'
             _check_outcome(checks, 'enroll_synonym', cmd, agent.handle(cmd), expect_tool='enroll', expect_ok=True)
 
             cmd = f'验证 甲 "{probe_a}"'
@@ -126,7 +120,16 @@ def evaluate_tooling() -> dict:
 
             # Second verify event enables drift check (>= 2 events).
             agent.handle(f'验证 甲 "{probe_a2}"')
-            _check_outcome(checks, 'drift_valid', '漂移 甲', agent.handle('漂移 甲'), expect_tool='drift', expect_ok=True)
+            drift_out = agent.handle('漂移 甲')
+            _check_outcome(
+                checks,
+                'drift_valid',
+                '漂移 甲',
+                drift_out,
+                expect_tool='drift',
+                expect_ok=True,
+                extra_ok='drift' in (drift_out.get('result') or {}),
+            )
 
             _check_outcome(checks, 'revoke_ask', '撤销 甲', agent.handle('撤销 甲'), expect_tool='revoke', expect_ok=True)
             _check_outcome(checks, 'revoke_confirm', '确认撤销 甲', agent.handle('确认撤销 甲'),
@@ -140,8 +143,16 @@ def evaluate_tooling() -> dict:
 
                 cmd = f'分离再辨认 "{mix_wav}"'
                 sep_id_out = agent.handle(cmd)
-                _check_outcome(checks, 'separate_identify_valid', cmd, sep_id_out, expect_tool='separate', expect_ok=True,
-                               extra_ok=len((sep_id_out.get('result') or {}).get('paths', [])) == 2)
+                sep_id_res = sep_id_out.get('result') or {}
+                _check_outcome(
+                    checks,
+                    'separate_identify_valid',
+                    cmd,
+                    sep_id_out,
+                    expect_tool='separate',
+                    expect_ok=True,
+                    extra_ok=len(sep_id_res.get('paths', [])) == 2 and 'names' in sep_id_res,
+                )
 
             _check_outcome(checks, 'exit_command', '退出', agent.handle('退出'), expect_tool='help', expect_ok=True)
 
@@ -160,7 +171,7 @@ def evaluate_tooling() -> dict:
             _check_outcome(checks, 'separate_identify_missing_arg', '分离再辨认', agent.handle('分离再辨认'),
                            expect_tool='separate', expect_ok=False)
 
-            cmd = f'注册 丙 同意 {_quote_paths(takes_c)}'
+            cmd = f'注册 丙 同意 {quote_paths(takes_c)}'
             _check_outcome(checks, 'missing_consent', cmd, agent.handle(cmd), expect_tool='enroll', expect_ok=False)
 
             cmd = f'验证 乙 "{audio_dir / "missing.wav"}"'

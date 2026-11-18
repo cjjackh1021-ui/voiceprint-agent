@@ -1,7 +1,9 @@
 """Content-hashed memory and disk cache for speaker embedding vectors."""
 import os
 import struct
+import threading
 import time
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -60,8 +62,8 @@ class CachedEmbedder(Embedder):
         return seg
 
     def _cache_path(self, digest: str) -> Path:
-        name_seg = self._safe_segment(self.name, 'unknown')
-        model_seg = self._safe_segment(self.model_id[:16], 'unknown')
+        name_seg = self._safe_segment(self.name or '', 'unknown')
+        model_seg = self._safe_segment((self.model_id or '')[:16], 'unknown')
         return self.cache_dir / name_seg / model_seg / f'{digest}.npy'
 
     def _is_valid_vec(self, arr: object) -> bool:
@@ -84,10 +86,11 @@ class CachedEmbedder(Embedder):
             return None
         loaded = None
         try:
-            loaded = np.load(cache_path, allow_pickle=False)
-            if self._is_valid_vec(loaded):
-                return np.ascontiguousarray(loaded, dtype=np.float32)
-        except (OSError, ValueError, EOFError, RuntimeError, struct.error):
+            with open(cache_path, 'rb') as fh:
+                loaded = np.load(fh, allow_pickle=False)
+                if self._is_valid_vec(loaded):
+                    return np.ascontiguousarray(loaded, dtype=np.float32)
+        except (OSError, ValueError, EOFError, RuntimeError, struct.error, zipfile.BadZipFile, TypeError):
             pass
         finally:
             # Guard against .npz archives masquerading as .npy holding an open ZipFile handle.
@@ -102,7 +105,7 @@ class CachedEmbedder(Embedder):
     def _save_disk(self, cache_path: Path, digest: str, vec: np.ndarray) -> None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         # Name must end in .npy or np.save appends another .npy, leaving orphan temp files.
-        tmp_path = cache_path.with_name(f'.{digest}.{os.getpid()}.tmp.npy')
+        tmp_path = cache_path.with_name(f'.{digest}.{os.getpid()}.{threading.get_ident()}.tmp.npy')
         try:
             np.save(tmp_path, vec, allow_pickle=False)
             os.replace(tmp_path, cache_path)
@@ -116,9 +119,10 @@ class CachedEmbedder(Embedder):
         compute_ms = (time.perf_counter() - c0) * 1000.0
         arr = np.ascontiguousarray(raw_vec, dtype=np.float32)
         if not self._is_valid_vec(arr):
-            raise ValueError(
-                f'{self.name} produced invalid embedding of shape {arr.shape}, dtype {arr.dtype}'
-            )
+            detail = f'shape {arr.shape}, dtype {arr.dtype}'
+            if not bool(np.all(np.isfinite(arr))):
+                detail += ', non-finite values'
+            raise ValueError(f'{self.name} produced invalid embedding of {detail}')
         return arr, compute_ms
 
     def embed_file(self, path: str) -> np.ndarray:
@@ -152,9 +156,10 @@ class CachedEmbedder(Embedder):
         return arr.copy()
 
     def stats(self) -> dict:
-        """Return cache hit/miss counters and per-call timing lists."""
+        """Return cache enabled flag, hit/miss counters, and per-call timing lists."""
         total = self._hits + self._misses
         return {
+            'enabled': bool(self.enabled),
             'hits': self._hits,
             'misses': self._misses,
             'total': total,
