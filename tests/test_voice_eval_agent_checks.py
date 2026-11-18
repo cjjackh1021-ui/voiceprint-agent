@@ -68,6 +68,28 @@ class AgentDimensionChecksTests(unittest.TestCase):
                 'expect_decision': 'unknown',
                 'speaker_name': None,
             },
+            {
+                'label': 'real-identify-split-winner-1089-1272',
+                'outcome': {
+                    'tool': 'identify',
+                    'ok': True,
+                    'result': {'decision': 'uncertain', 'candidate': '1089'},
+                    'reply': '没有足够把握。1089 过了自己的阈值，但分数最高的是 1272。请再录一段更长的录音。',
+                },
+                'expect_decision': 'uncertain',
+                'speaker_name': None,
+            },
+            {
+                'label': 'real-identify-gap-uncertain-1089',
+                'outcome': {
+                    'tool': 'identify',
+                    'ok': True,
+                    'result': {'decision': 'uncertain', 'candidate': '1089'},
+                    'reply': '没有足够把握。最接近的是 1089。请再录一段更长的录音。',
+                },
+                'expect_decision': 'uncertain',
+                'speaker_name': None,
+            },
         ]
         with patched_dpapi():
             res = evaluate_response(real_non_detail_checks=real_checks)
@@ -120,7 +142,40 @@ class AgentDimensionChecksTests(unittest.TestCase):
             )
             self.assertFalse(ok_vec, f'failed to catch >16 vector leak for detail={detail_flag}: {msg_vec}')
 
-        # Negative test 5: evaluate_response flags leaked real_non_detail_checks cleanly
+        # Negative test 5: split-winner lookalike with numeric score/threshold leak must still be caught
+        for bad_reply in (
+            '没有足够把握。1089 过了自己的阈值，但分数最高的是 1272 0.42。请再录一段更长的录音。',
+            '没有足够把握。1089 过了自己的阈值，但分数最高的是 0.42。请再录一段更长的录音。',
+            '没有足够把握。1089 过了自己的阈值 0.42，但分数最高的是 1272。请再录一段更长的录音。',
+        ):
+            ok_sw, msg_sw = check_reply_payload(
+                {
+                    'tool': 'identify',
+                    'ok': True,
+                    'result': {'decision': 'uncertain', 'candidate': '1089'},
+                    'reply': bad_reply,
+                },
+                expect_decision='uncertain',
+                detail=False,
+                speaker_name=None,
+            )
+            self.assertFalse(ok_sw, f'failed to catch leaked split-winner reply {bad_reply!r}: {msg_sw}')
+
+        # Negative test 6: verify cannot reuse identify split-winner threshold phrasing
+        ok_ver_sw, msg_ver_sw = check_reply_payload(
+            {
+                'tool': 'verify',
+                'ok': True,
+                'result': {'decision': 'uncertain', 'task': 'verify'},
+                'reply': '没有足够把握。alice 过了自己的阈值，但分数最高的是 bob。请再录一段更长的录音。',
+            },
+            expect_decision='uncertain',
+            detail=False,
+            speaker_name='alice',
+        )
+        self.assertFalse(ok_ver_sw, msg_ver_sw)
+
+        # Negative test 7: evaluate_response flags leaked real_non_detail_checks cleanly
         with patched_dpapi():
             bad = evaluate_response(
                 real_non_detail_checks=[

@@ -14,6 +14,9 @@ FORBIDDEN_NON_DETAIL_TERMS = ('归一化相似度', '原始余弦', '夹角', '�
 _VECTOR_SEQ_RE = re.compile(r'\[(?:\s*-?\d+(?:\.\d+)?\s*,){4,}')
 _FLOAT_RE = re.compile(r'-?\d+\.\d+')
 _NUMERIC_THRESHOLD_RE = re.compile(r'阈值\s*[:：=]?\s*-?\d+(?:\.\d+)?')
+_SPLIT_WINNER_REPLY_RE = re.compile(
+    r'^没有足够把握。(?P<other>[^\s。，]+) 过了自己的阈值，但分数最高的是 (?P<best>[^\s。，]+)。请再录一段更长的录音。$'
+)
 
 
 def _contains_large_numeric_vector(obj: object) -> bool:
@@ -29,12 +32,34 @@ def _contains_large_numeric_vector(obj: object) -> bool:
     return False
 
 
-def _scrub_names(reply: str, result: dict, speaker_name: str | None) -> str:
+def _scrub_names(
+    reply: str,
+    result: dict,
+    speaker_name: str | None,
+    extra_names: list[str] | None = None,
+) -> str:
     scrubbed = reply
-    candidates = [speaker_name, result.get('name'), result.get('candidate')]
+    candidates = [speaker_name, result.get('name'), result.get('candidate'), *(extra_names or ())]
     for token in sorted({str(c) for c in candidates if c}, key=len, reverse=True):
         scrubbed = scrubbed.replace(token, '')
     return scrubbed
+
+
+def _split_winner_match(
+    reply: str,
+    result: dict,
+    tool: str | None,
+    expect_decision: str,
+) -> re.Match[str] | None:
+    if tool != 'identify' or expect_decision != 'uncertain':
+        return None
+    match = _SPLIT_WINNER_REPLY_RE.fullmatch(reply)
+    if match is None:
+        return None
+    candidate = result.get('candidate')
+    if candidate is not None and match.group('other') != str(candidate):
+        return None
+    return match
 
 
 def _inspect_reply_payload(
@@ -60,11 +85,15 @@ def _inspect_reply_payload(
                 return False, True, f'forbidden score term {term!r} leaked when detail=False'
         if _NUMERIC_THRESHOLD_RE.search(reply):
             return False, True, f'numeric threshold leaked in reply: {reply!r}'
-        if '阈值' in reply and not (expect_decision == 'unknown' and '未达到辨认阈值' in reply):
+        split_match = _split_winner_match(reply, result, tool, expect_decision)
+        allow_unknown_threshold = expect_decision == 'unknown' and tool != 'verify' and '未达到辨认阈值' in reply
+        if '阈值' in reply and not allow_unknown_threshold and split_match is None:
             return False, True, f'threshold keyword leaked in reply: {reply!r}'
-        scrubbed = _scrub_names(reply, result, speaker_name)
-        if _FLOAT_RE.search(scrubbed):
+        scrubbed_base = _scrub_names(reply, result, speaker_name)
+        if _FLOAT_RE.search(scrubbed_base):
             return False, True, f'floating-point score leaked in reply: {reply!r}'
+        extra = [split_match.group('best')] if split_match is not None else None
+        scrubbed = _scrub_names(reply, result, speaker_name, extra_names=extra)
         if expect_decision != 'locked' and re.search(r'\d', scrubbed):
             return False, True, f'unexpected numeric digit leaked in reply: {reply!r}'
 
@@ -132,7 +161,6 @@ def _calibrate_uncertain_blend(
     wav_b: Path,
     command_prefix: str,
     tag: str,
-    avoid_word: str | None = None,
 ) -> Path:
     """Search blend alpha using unique filenames to hit decision='uncertain' cleanly without cache/lock interference."""
     sig_a, sr = sf.read(str(wav_a), dtype='float32')
@@ -144,10 +172,8 @@ def _calibrate_uncertain_blend(
     blend_dir.mkdir(parents=True, exist_ok=True)
     last_accept = 0.0
     first_reject = 1.0
-    fallback: Path | None = None
 
     def _probe_grid(alphas: np.ndarray, prefix: str) -> tuple[Path | None, float, float]:
-        nonlocal fallback
         lo, hi = last_accept, first_reject
         calib = VoiceAgent(root / f'calib_{tag}_{prefix}', embedder, detail=True, audio_roots=[root])
         try:
@@ -160,11 +186,8 @@ def _calibrate_uncertain_blend(
                 out = calib.handle(f'{command_prefix} "{candidate}"')
                 dec = (out.get('result') or {}).get('decision')
                 if dec == 'uncertain':
-                    if fallback is None:
-                        fallback = candidate
-                    if avoid_word is None or avoid_word not in out.get('reply', ''):
-                        return candidate, lo, hi
-                elif dec == 'accept':
+                    return candidate, lo, hi
+                if dec == 'accept':
                     lo = float(alpha)
                 elif dec in ('reject', 'unknown'):
                     hi = float(alpha)
@@ -181,8 +204,6 @@ def _calibrate_uncertain_blend(
     found, _, _ = _probe_grid(np.linspace(last_accept, first_reject, 61), 'fine')
     if found is not None:
         return found
-    if fallback is not None:
-        return fallback
     raise RuntimeError(f'failed to synthesize uncertain blend for {command_prefix}')
 
 
@@ -218,7 +239,7 @@ def evaluate_response(real_non_detail_checks: list[dict] | None = None) -> dict:
             root, embedder, alice_probe, bob_probe, '验证 alice', 'verify'
         )
         uncertain_identify_wav = _calibrate_uncertain_blend(
-            root, embedder, alice_probe, bob_probe, '辨认', 'identify', avoid_word='阈值'
+            root, embedder, alice_probe, bob_probe, '辨认', 'identify'
         )
 
         for detail_flag in (False, True):
