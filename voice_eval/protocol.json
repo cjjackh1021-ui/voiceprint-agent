@@ -1,0 +1,42 @@
+{
+  "source": "claude-eval-learning.md",
+  "adapted_to": "voiceprint agent decisions, not student grading",
+  "suites": [
+    "verify",
+    "verify_impostor",
+    "verify_short",
+    "verify_noise",
+    "identify",
+    "enroll_quality",
+    "security"
+  ],
+  "splits": {
+    "validation": "first 20 LibriSpeech test-clean speakers, used to compare embedders",
+    "locked": "next 20 test-clean speakers, reported separately and not used to choose an embedder"
+  },
+  "hidden_from_agent": [
+    "true speaker",
+    "expected decision",
+    "grader"
+  ],
+  "not_optimizable": [
+    "hidden labels",
+    "grader.py",
+    "locked split",
+    "security checks"
+  ],
+  "allowed_changes": [
+    "VPNet checkpoint",
+    "threshold formula in voiceprint/scoring.py"
+  ],
+  "adoption_rule": "On validation verify cases, the paired bootstrap 95% interval of accuracy must lie above 0, false-accept rate must not rise by more than 0.02, and every security check must still pass.",
+  "primary_metric": "verify accuracy, where uncertain and missing decisions are incorrect",
+  "case_version": 2,
+  "case_rules": {
+    "probe": "from a chapter the enrollment did not use whenever the speaker has one; single-chapter speakers are marked probe_session=same",
+    "verify": "balanced: one genuine and one impostor trial per speaker; this is the primary metric",
+    "verify_impostor": "every other speaker of the split claims the name; measures false accepts only",
+    "verify_short / verify_noise": "one genuine and one impostor trial per speaker",
+    "uncertain": "never counted as a correct automatic decision, in identification as in verification"
+  }
+}
