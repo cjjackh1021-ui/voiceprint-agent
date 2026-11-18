@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from voice_eval.cases import load
+from voice_eval.cases import case_version, load
 from voiceprint.embed import cohort_matrix, load_embedder
 from voiceprint.scoring import decide, profile_for
 
@@ -19,9 +19,9 @@ TRAIN = Path(__file__).resolve().parents[1] / 'data' / 'LibriSpeech' / 'train-cl
 SUITES = ('verify', 'verify_impostor')
 
 
-def pairs(embedder):
+def pairs(embedder, case_dir: Path | None = None) -> list[tuple[str, np.ndarray, np.ndarray]]:
     found = []
-    for case in load('validation'):
+    for case in load('validation', case_dir=case_dir):
         if case['suite'] not in SUITES:
             continue
         paths = shlex.split(case['steps'][0], posix=True)[3:]
@@ -50,15 +50,19 @@ def evaluate(rows, cohort, profile, alpha, band):
     return auto, correct / len(rows), fa / max(n_rej, 1), fr / max(n_acc, 1), review / len(rows)
 
 
-def main():
+def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--embedder', default='vpnet', choices=['stats', 'vpnet', 'ecapa'])
-    args = parser.parse_args()
+    parser.add_argument('--case-dir', default=None, type=Path)
+    parser.add_argument('--train-root', default=None, type=Path)
+    args = parser.parse_args(argv)
+    train_root = args.train_root if args.train_root is not None else TRAIN
     embedder = load_embedder(args.embedder)
-    cohort, _names = cohort_matrix(embedder, TRAIN)
-    rows = pairs(embedder)
+    cohort, _names = cohort_matrix(embedder, train_root)
+    rows = pairs(embedder, case_dir=args.case_dir)
     current = profile_for(embedder.name)
-    print(f'{embedder.name}: cohort {len(cohort)}, validation trials {len(rows)}, '
+    ver = case_version(case_dir=args.case_dir)
+    print(f'{embedder.name} (v{ver}): cohort {len(cohort)}, validation trials {len(rows)}, '
           f'current alpha {current["alpha"]} band {current["band"]}', flush=True)
     for alpha in (0.15, 0.25, 0.35, 0.45, 0.6):
         for band in (0.0, 0.2, 0.35):
