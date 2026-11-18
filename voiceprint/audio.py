@@ -1,4 +1,5 @@
 """Load utterances as 16 kHz mono float32, after checking that the path is a sane local recording."""
+import contextlib
 import hashlib
 import os
 from pathlib import Path
@@ -50,7 +51,27 @@ def check_audio(path: str, roots: list[Path] | None = None) -> Path:
         raise AudioError(f'录音长 {info.duration:.0f} 秒，超过 {MAX_SECONDS:.0f} 秒上限：{text}')
     if info.duration < MIN_SECONDS:
         raise AudioError(f'录音只有 {info.duration:.2f} 秒，至少需要 {MIN_SECONDS} 秒：{text}')
+    _assert_finite_audio(resolved, int(MAX_SECONDS * info.samplerate))
     return resolved
+
+
+def _assert_finite_audio(resolved: Path, max_frames: int | None = None):
+    """Scan decoded PCM frames in bounded blocks to reject NaN/Inf samples before modeling."""
+    if max_frames is None:
+        info = sf.info(str(resolved))
+        max_frames = int(MAX_SECONDS * info.samplerate)
+    frames_arg = max_frames if max_frames > 0 else -1
+    try:
+        with contextlib.closing(
+            sf.blocks(str(resolved), blocksize=65536, frames=frames_arg, dtype='float32')
+        ) as blocks:
+            for block in blocks:
+                if not np.all(np.isfinite(block)):
+                    raise AudioError(f'录音包含无效采样（NaN/Inf）：{resolved}')
+    except AudioError:
+        raise
+    except Exception as exc:
+        raise AudioError(f'不是可读取的录音：{resolved}（{type(exc).__name__}）') from None
 
 
 def file_digest(path: str) -> str:
@@ -69,10 +90,12 @@ def load_wav(path: str, max_seconds: float = 30.0) -> np.ndarray:
     # Only the part that is used is decoded, so a long file cannot fill the memory.
     native = sf.info(path).samplerate
     wav, sr = sf.read(path, frames=int(max_seconds * native), dtype='float32', always_2d=False)
-    if wav.ndim > 1:
-        wav = wav.mean(axis=1)
     if wav.shape[0] == 0:
         raise AudioError(f'录音里没有采样：{path}')
+    if not np.all(np.isfinite(wav)):
+        raise AudioError(f'录音包含无效采样（NaN/Inf）：{path}')
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
     if sr != SR:
         from math import gcd
         from scipy.signal import resample_poly
@@ -84,6 +107,8 @@ def load_wav(path: str, max_seconds: float = 30.0) -> np.ndarray:
     if wav.shape[0] < SR:
         # Repeat instead of padding with zeros: silence the model never saw in training drags the embedding.
         wav = np.tile(wav, -(-SR // wav.shape[0]))[:SR]
+    if not np.all(np.isfinite(wav)):
+        raise AudioError(f'录音包含无效采样（NaN/Inf）：{path}')
     return np.ascontiguousarray(wav, dtype=np.float32)
 
 

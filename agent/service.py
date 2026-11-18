@@ -19,6 +19,13 @@ from voiceprint.store import Store
 TRAIN_ROOT = Path(__file__).resolve().parents[1] / 'data' / 'LibriSpeech' / 'train-clean-100'
 DECISION_ZH = {'accept': '接受', 'reject': '拒绝', 'uncertain': '不确定', 'unknown': '库里没有匹配的人'}
 EXPORT_WORDS = ('明文', '原始声纹', '导出模板', '声纹向量')
+ENGLISH_EXPORT_TRIGGERS = (
+    'export_template',
+    'dump embedding',
+    'print embedding',
+    'export embedding',
+    'raw embedding',
+)
 NEAR_DUPLICATE_COSINE = 0.995
 MAX_FAILED_VERIFY = 5
 LOCK_MINUTES = 10
@@ -57,15 +64,10 @@ class VoiceAgent:
 
     def _dispatch(self, text: str) -> dict:
         if not text:
+            self.pending = None
             return self._reply('help', True, {}, '请输入命令。输入“帮助”查看用法。')
         wants_export = any(word in text for word in EXPORT_WORDS)
-        try:
-            tokens = shlex.split(text, posix=True)
-        except ValueError as exc:
-            if wants_export:
-                return self._refuse_export()
-            return self._reply('error', False, {}, f'命令没有解析成功：{exc}')
-        head, rest = tokens[0], tokens[1:]
+        wants_english_export = any(trigger in text.lower() for trigger in ENGLISH_EXPORT_TRIGGERS)
         commands = {
             '注册': self._enroll, '录入': self._enroll,
             '验证': self._verify, '核对': self._verify,
@@ -74,6 +76,21 @@ class VoiceAgent:
             '轮换密钥': self._rotate, '漂移': self._drift,
             '分离再辨认': self._separate_and_identify, '分离': self._separate,
         }
+        try:
+            tokens = shlex.split(text, posix=True)
+        except ValueError as exc:
+            head_guess = text.split(maxsplit=1)[0]
+            if head_guess != '确认撤销':
+                self.pending = None
+            if wants_export or (head_guess not in commands and wants_english_export):
+                return self._refuse_export()
+            return self._reply('error', False, {}, f'命令没有解析成功：{exc}')
+        if not tokens:
+            self.pending = None
+            return self._reply('help', True, {}, '请输入命令。输入“帮助”查看用法。')
+        head, rest = tokens[0], tokens[1:]
+        if head != '确认撤销':
+            self.pending = None
         if head in ('帮助', 'help'):
             return self._reply('help', True, {}, HELP)
         if head in ('退出',):
@@ -88,10 +105,8 @@ class VoiceAgent:
         if head in commands:
             # A known command is run as that command even if a name or a path happens to contain
             # one of the export words; none of the commands returns a vector.
-            if self.pending and head != '确认撤销':
-                self.pending = None
             return commands[head](rest)
-        if wants_export:
+        if wants_export or wants_english_export:
             return self._refuse_export()
         return self._reply('help', False, {}, '没有对应的工具。\n' + HELP)
 
@@ -169,8 +184,10 @@ class VoiceAgent:
                      f'结论：{DECISION_ZH[score["decision"]]}。{score["reason"]}')
             return self._reply('verify', True, score, reply)
         result = {'decision': score['decision'], 'task': 'verify'}
-        return self._reply('verify', True, result,
-                           f'{name}：结论：{DECISION_ZH[score["decision"]]}。{score["reason"]}')
+        reply = f'{name}：结论：{DECISION_ZH[score["decision"]]}。'
+        if score['decision'] == 'uncertain':
+            reply += '请再录一段更长、更安静的录音。'
+        return self._reply('verify', True, result, reply)
 
     def _identify(self, rest: list[str]) -> dict:
         if len(rest) != 1:
@@ -265,6 +282,8 @@ class VoiceAgent:
         if len(rest) != 1:
             return self._reply('drift', False, {}, '用法：漂移 姓名')
         name = rest[0]
+        if not self.store.exists(name):
+            return self._reply('drift', False, {'decision': 'unknown'}, f'没有 {name} 的模板。')
         rows = self.store.events(name)
         scores = [row[2] for row in rows if row[1] in ('verify', 'identify')]
         if len(scores) < 2:
