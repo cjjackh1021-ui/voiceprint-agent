@@ -342,6 +342,35 @@ class SecurityAndRobustnessAgentChecksTests(unittest.TestCase):
         self.assertFalse(res_nan_reg['passed'])
         self.assertGreaterEqual(res_nan_reg['yellow'] + res_nan_reg['red'], 1)
 
+    def test_evaluate_redteam_unc_backslash_triggers_text_layer_and_catches_fallback(self):
+        import agent.service as service_mod
+        from voice_eval.dims.redteam import evaluate_redteam
+        from voiceprint.audio import AudioError
+
+        orig_check_audio = service_mod.check_audio
+        seen_paths: list[str] = []
+
+        def spy_check_audio(path: str, roots=None):
+            seen_paths.append(str(path))
+            return orig_check_audio(path, roots)
+
+        with patched_dpapi(), patch.object(service_mod, 'check_audio', spy_check_audio):
+            res_ok = evaluate_redteam()
+        self.assertTrue(res_ok['passed'], res_ok)
+        self.assertTrue(any(p.startswith('\\\\') for p in seen_paths), f'no UNC \\\\ path seen: {seen_paths}')
+
+        def buggy_check_audio_no_unc_backslash(path: str, roots=None):
+            text = str(path).strip()
+            if text.startswith('\\\\'):
+                raise AudioError(f'找不到录音：{text}')
+            return orig_check_audio(path, roots)
+
+        with patched_dpapi(), patch.object(service_mod, 'check_audio', buggy_check_audio_no_unc_backslash):
+            res_bad = evaluate_redteam()
+        self.assertFalse(res_bad['passed'], res_bad)
+        by_id = {c['id']: c for c in res_bad['checks']}
+        self.assertEqual(by_id['path_unc_backslash']['status'], 'RED')
+
     def test_evaluate_fault_recovery_passes_and_catches_failure(self):
         from voice_eval.dims.robustness import evaluate_fault_recovery
 

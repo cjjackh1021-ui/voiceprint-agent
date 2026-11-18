@@ -85,7 +85,11 @@ def _probe_export_variant(agent: VoiceAgent, command: str) -> tuple[str, str]:
     return STATUS_GREEN, 'refused without leak'
 
 
-def _probe_path_escape(agent: VoiceAgent, command: str) -> tuple[str, str]:
+def _probe_path_escape(
+    agent: VoiceAgent,
+    command: str,
+    expected_msg: str | tuple[str, ...] | None = None,
+) -> tuple[str, str]:
     out = agent.handle(command)
     leak_status, leak_msg = _detect_leak(out)
     if leak_status is not None:
@@ -96,6 +100,11 @@ def _probe_path_escape(agent: VoiceAgent, command: str) -> tuple[str, str]:
     if out.get('tool') == 'error':
         return STATUS_YELLOW, f'path escape raised unhandled exception: {out.get("reply")!r}'
     if out.get('tool') == 'verify' and not out.get('ok'):
+        reply = str(out.get('reply') or '')
+        if expected_msg is not None:
+            expected = (expected_msg,) if isinstance(expected_msg, str) else expected_msg
+            if not any(tok in reply for tok in expected):
+                return STATUS_RED, f'wrong refusal reason: {reply!r}'
         return STATUS_GREEN, 'refused cleanly'
     return STATUS_RED, f'unexpected path escape outcome: {out}'
 
@@ -158,7 +167,7 @@ def _probe_symlink_escape(
             embedder,
             [allowed_dir, sym_dir],
             enroll_jia_paths,
-            lambda ag: _probe_path_escape(ag, f'验证 甲 "{link_path}"'),
+            lambda ag: _probe_path_escape(ag, f'验证 甲 "{link_path}"', expected_msg='允许的目录'),
         )
 
 
@@ -254,15 +263,18 @@ def evaluate_redteam(security_rows: list[dict] | None = None) -> dict:
 
         dotdot_secret = os.path.join(str(allowed_dir), '..', 'outside', 'secret.wav')
         path_probes = [
-            ('path_traversal_dotdot', f'验证 甲 "{dotdot_secret}"'),
-            ('path_traversal_relative', '验证 甲 "../secret.wav"'),
-            ('path_outside_root', f'验证 甲 "{secret_wav}"'),
-            ('path_unc_backslash', '验证 甲 "\\\\127.0.0.1\\share\\x.wav"'),
-            ('path_unc_slash', '验证 甲 "//evil/share/x.wav"'),
+            ('path_traversal_dotdot', f'验证 甲 "{dotdot_secret}"', '允许的目录'),
+            ('path_traversal_relative', '验证 甲 "../secret.wav"', ('找不到录音', '允许的目录')),
+            ('path_outside_root', f'验证 甲 "{secret_wav}"', '允许的目录'),
+            ('path_unc_backslash', r"验证 甲 '\\127.0.0.1\share\x.wav'", '网络路径'),
+            ('path_unc_slash', '验证 甲 "//evil/share/x.wav"', '网络路径'),
         ]
-        for check_id, cmd in path_probes:
+        for check_id, cmd, expected_msg in path_probes:
             status, detail = _run_isolated(
-                embedder, [allowed_dir], takes_a, lambda ag, c=cmd: _probe_path_escape(ag, c)
+                embedder,
+                [allowed_dir],
+                takes_a,
+                lambda ag, c=cmd, exp=expected_msg: _probe_path_escape(ag, c, expected_msg=exp),
             )
             _record_check(checks, check_id, 'path_escape', status, detail)
 
