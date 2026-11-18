@@ -225,5 +225,180 @@ class AgentDimensionChecksTests(unittest.TestCase):
         self.assertTrue(any('revoke' in c['id'] for c in failed), failed)
 
 
+class SecurityAndRobustnessAgentChecksTests(unittest.TestCase):
+    def test_evaluate_redteam_passes_and_merges_security_rows(self):
+        from voice_eval.dims.redteam import evaluate_redteam
+
+        with patched_dpapi():
+            res = evaluate_redteam()
+        self.assertTrue(res['passed'], res)
+        self.assertEqual(res['yellow'], 0)
+        self.assertEqual(res['red'], 0)
+        self.assertEqual(res['skipped'], 0)
+        self.assertEqual(res['green'], res['total_executed'])
+        self.assertGreaterEqual(res['total_executed'], 18)
+
+        ids = {c['id'] for c in res['checks']}
+        for required in (
+            'export_zh_vector',
+            'export_zh_raw',
+            'export_unclosed_quote',
+            'export_en_dump',
+            'path_traversal_dotdot',
+            'path_outside_root',
+            'path_unc_backslash',
+            'path_unc_slash',
+            'path_symlink_escape',
+            'name_nul_byte',
+            'name_newline_inject',
+            'name_overlong',
+            'name_whitespace_only',
+            'poison_empty_bytes',
+            'poison_non_audio_wav',
+            'poison_silence_zeros',
+            'poison_nan_verify',
+            'poison_nan_enroll',
+            'poison_inf_verify',
+            'poison_tiny_01s',
+            'poison_bad_suffix',
+            'enroll_missing_consent',
+            'enroll_overwrite_existing',
+        ):
+            self.assertIn(required, ids)
+
+        with patched_dpapi():
+            merged_ok = evaluate_redteam(
+                security_rows=[
+                    {'id': 'security-no-plaintext', 'correct': True, 'reply': 'ok'},
+                    {'id': 'security-rotate', 'correct': True, 'reply': 'ok'},
+                ]
+            )
+        self.assertTrue(merged_ok['passed'], merged_ok)
+        self.assertEqual(merged_ok['green'], res['green'] + 2)
+
+        with patched_dpapi():
+            merged_fail = evaluate_redteam(
+                security_rows=[{'id': 'security-setup', 'correct': False, 'reply': 'failed setup'}]
+            )
+        self.assertFalse(merged_fail['passed'])
+        self.assertEqual(merged_fail['red'], 1)
+
+    def test_evaluate_redteam_symlink_oserror_classifies_skipped_no_privilege(self):
+        from voice_eval.dims.redteam import evaluate_redteam
+
+        with patched_dpapi(), patch('os.symlink', side_effect=PermissionError('privilege not held')):
+            res = evaluate_redteam()
+        self.assertTrue(res['passed'], res)
+        self.assertEqual(res['yellow'], 0)
+        self.assertEqual(res['red'], 0)
+        self.assertEqual(res['skipped'], 1)
+        by_id = {c['id']: c for c in res['checks']}
+        self.assertEqual(by_id['path_symlink_escape']['status'], 'SKIPPED_NO_PRIVILEGE')
+        self.assertEqual(by_id['path_outside_root']['status'], 'GREEN')
+
+    def test_evaluate_redteam_catches_injected_leaks_and_bypasses(self):
+        from voice_eval.dims.redteam import evaluate_redteam
+
+        orig_handle = VoiceAgent.handle
+
+        def leaking_export(self, text: str) -> dict:
+            out = orig_handle(self, text)
+            if 'dump embedding' in text.lower():
+                out = dict(out)
+                out['result'] = {'embedding': [0.1] * 32}
+            return out
+
+        with patched_dpapi(), patch.object(VoiceAgent, 'handle', leaking_export):
+            res_leak = evaluate_redteam()
+        self.assertFalse(res_leak['passed'])
+        self.assertGreaterEqual(res_leak['red'], 1)
+
+        def crashing_verify(self, text: str) -> dict:
+            out = orig_handle(self, text)
+            if 'bad.py' in text:
+                return {'tool': 'error', 'ok': False, 'result': {'error': 'RuntimeError'}, 'reply': 'Traceback (most recent call last)'}
+            return out
+
+        with patched_dpapi(), patch.object(VoiceAgent, 'handle', crashing_verify):
+            res_yellow = evaluate_redteam()
+        self.assertFalse(res_yellow['passed'])
+        self.assertGreaterEqual(res_yellow['yellow'], 1)
+
+        def allow_outside_root(self, text: str) -> dict:
+            out = orig_handle(self, text)
+            if 'secret.wav' in text and '..' not in text:
+                return {'tool': 'verify', 'ok': True, 'result': {'decision': 'accept'}, 'reply': 'bypassed'}
+            return out
+
+        with patched_dpapi(), patch('os.symlink', side_effect=PermissionError('privilege not held')), \
+                patch.object(VoiceAgent, 'handle', allow_outside_root):
+            res_escape = evaluate_redteam()
+        self.assertFalse(res_escape['passed'])
+        self.assertGreaterEqual(res_escape['red'], 1)
+        self.assertEqual({c['id']: c for c in res_escape['checks']}['path_outside_root']['status'], 'RED')
+
+        with patched_dpapi(), patch('voiceprint.audio._assert_finite_audio', lambda *_a, **_kw: None):
+            res_nan_reg = evaluate_redteam()
+        self.assertFalse(res_nan_reg['passed'])
+        self.assertGreaterEqual(res_nan_reg['yellow'] + res_nan_reg['red'], 1)
+
+    def test_evaluate_fault_recovery_passes_and_catches_failure(self):
+        from voice_eval.dims.robustness import evaluate_fault_recovery
+
+        with patched_dpapi():
+            res = evaluate_fault_recovery()
+        self.assertTrue(res['passed'], res)
+        self.assertEqual(res['fault_total'], 4)
+        self.assertEqual(res['recovered'], 4)
+        self.assertAlmostEqual(res['recovery_rate'], 1.0, places=6)
+
+        orig_handle = VoiceAgent.handle
+
+        def corrupt_after_fault(self, text: str) -> dict:
+            out = orig_handle(self, text)
+            if 'corrupt.wav' in text:
+                self._faulted = True
+            elif getattr(self, '_faulted', False) and text.startswith('验证 '):
+                out = dict(out)
+                out['ok'] = False
+                out['result'] = {'decision': 'reject'}
+            return out
+
+        with patched_dpapi(), patch.object(VoiceAgent, 'handle', corrupt_after_fault):
+            bad = evaluate_fault_recovery()
+        self.assertFalse(bad['passed'])
+        self.assertLess(bad['recovery_rate'], 1.0)
+
+    def test_evaluate_consistency_passes_and_catches_non_determinism(self):
+        from voice_eval.dims.robustness import evaluate_consistency
+
+        with patched_dpapi():
+            res = evaluate_consistency(repeats=3)
+        self.assertTrue(res['passed'], res)
+        self.assertEqual(res['trials'], 5)
+        self.assertEqual(res['repeats'], 3)
+        self.assertAlmostEqual(res['agreement_rate'], 1.0, places=6)
+        self.assertLess(res['max_score_spread'], 1e-4)
+
+        orig_score = VoiceAgent._score
+        counter = {'n': 0}
+
+        def unstable_score(self, name: str, probe, task: str = 'verify') -> dict:
+            out = dict(orig_score(self, name, probe, task=task))
+            counter['n'] += 1
+            if counter['n'] % 2 == 0:
+                out['score'] = -5.0
+                out['decision'] = 'reject'
+            else:
+                out['score'] = 5.0
+                out['decision'] = 'accept'
+            return out
+
+        with patched_dpapi(), patch.object(VoiceAgent, '_score', unstable_score):
+            bad = evaluate_consistency(repeats=3)
+        self.assertFalse(bad['passed'])
+        self.assertLess(bad['agreement_rate'], 1.0)
+
+
 if __name__ == '__main__':
     unittest.main()

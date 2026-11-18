@@ -173,5 +173,180 @@ class TaskDimensionTests(unittest.TestCase):
         self.assertEqual(task_out['eer_primary'], task_out['verify_all_metrics']['eer'])
 
 
+class PerfDimensionTests(unittest.TestCase):
+    def test_percentile_stats_empty_and_non_empty(self):
+        import numpy as np
+
+        from voice_eval.dims.perf import percentile_stats
+
+        empty = percentile_stats([])
+        self.assertEqual(empty, {'n': 0, 'mean_ms': None, 'p50_ms': None, 'p95_ms': None, 'total_ms': 0.0})
+
+        stats = percentile_stats(np.array([10.0, 20.0, 30.0, 40.0, 50.0]))
+        self.assertEqual(stats['n'], 5)
+        self.assertAlmostEqual(stats['mean_ms'], 30.0, places=6)
+        self.assertAlmostEqual(stats['p50_ms'], 30.0, places=6)
+        self.assertAlmostEqual(stats['p95_ms'], 48.0, places=6)
+        self.assertAlmostEqual(stats['total_ms'], 150.0, places=6)
+
+        with self.assertRaises(ValueError):
+            percentile_stats([1.0, float('nan')])
+
+    def test_current_rss_mb_handles_darwin_linux_and_missing_resource(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from voice_eval.dims import perf
+
+        real_rss = perf.current_rss_mb()
+        if real_rss is not None:
+            self.assertGreater(real_rss, 0.0)
+
+        fake_usage = SimpleNamespace(ru_maxrss=104857600)  # 100 MiB if bytes
+        with patch.object(perf, 'resource', SimpleNamespace(RUSAGE_SELF=0, getrusage=lambda _who: fake_usage)), \
+                patch.object(perf.sys, 'platform', 'darwin'):
+            self.assertAlmostEqual(perf.current_rss_mb(), 100.0, places=6)
+
+        fake_linux_usage = SimpleNamespace(ru_maxrss=102400)  # 100 MiB if KiB
+        with patch.object(perf, 'resource', SimpleNamespace(RUSAGE_SELF=0, getrusage=lambda _who: fake_linux_usage)), \
+                patch.object(perf.sys, 'platform', 'linux'):
+            self.assertAlmostEqual(perf.current_rss_mb(), 100.0, places=6)
+
+        with patch.object(perf, 'resource', None), patch.object(perf.sys, 'platform', 'linux'):
+            self.assertIsNone(perf.current_rss_mb())
+
+        with patch.object(perf, 'resource', None), patch.object(perf.sys, 'platform', 'win32'), \
+                patch.object(perf, '_windows_rss_mb', return_value=None):
+            self.assertIsNone(perf.current_rss_mb())
+
+    def test_summarize_perf_includes_case_steps_embed_compute_and_memory(self):
+        from voice_eval.dims.perf import summarize_perf
+
+        cache_stats = {
+            'hits': 3,
+            'misses': 2,
+            'total': 5,
+            'hit_rate': 0.6,
+            'compute_ms_list': [10.0, 30.0],
+            'lookup_ms_list': [0.2, 0.4, 0.6],
+        }
+        summary = summarize_perf(
+            case_timings_ms=[12.0, 24.0, 36.0],
+            step_timings_ms={'enroll': [15.0, 25.0], 'verify': [5.0, 7.0, 9.0]},
+            cache_stats=cache_stats,
+            peak_tracemalloc_mb=4.25,
+            rss_mb=92.5,
+        )
+        self.assertEqual(summary['case']['n'], 3)
+        self.assertAlmostEqual(summary['case']['p50_ms'], 24.0, places=6)
+        self.assertAlmostEqual(summary['total_seconds'], 0.072, places=6)
+        self.assertEqual(summary['steps']['enroll']['n'], 2)
+        self.assertEqual(summary['steps']['verify']['n'], 3)
+        self.assertEqual(summary['embed_compute']['n'], 2)
+        self.assertAlmostEqual(summary['embed_compute']['mean_ms'], 20.0, places=6)
+        self.assertEqual(summary['embed_lookup']['n'], 3)
+        self.assertEqual(summary['cache']['hits'], 3)
+        self.assertEqual(summary['cache']['misses'], 2)
+        self.assertAlmostEqual(summary['cache']['hit_rate'], 0.6, places=6)
+        self.assertAlmostEqual(summary['peak_tracemalloc_mb'], 4.25, places=6)
+        self.assertAlmostEqual(summary['rss_mb'], 92.5, places=6)
+
+        no_cache = summarize_perf([5.0], {}, None, 1.0, None)
+        self.assertFalse(no_cache['cache']['enabled'])
+        self.assertEqual(no_cache['embed_compute']['n'], 0)
+        self.assertIsNone(no_cache['rss_mb'])
+
+
+class RobustnessDimensionTests(unittest.TestCase):
+    def test_evaluate_robustness_groups_by_axis_and_variant_and_computes_worst_drop(self):
+        from tests._helpers import patched_dpapi
+        from voice_eval.dims.robustness import evaluate_robustness
+
+        def _rob_row(cid: str, suite: str, axis: str, variant: str, expect: str, decision: str, score: float | None):
+            row = _make_verify_row(cid, suite, expect, decision, score=score, raw_score=0.5 if score is not None else None)
+            row['axis'] = axis
+            row['variant'] = variant
+            return row
+
+        rows = [
+            # Non-robustness rows must be ignored by by_axis/by_variant.
+            _make_verify_row('v1', 'verify', 'accept', 'accept', score=3.0, raw_score=0.9),
+            # Noise axis: 2 variants
+            _rob_row('n1', 'robustness_noise', 'noise', 'white_snr20', 'accept', 'accept', 2.5),
+            _rob_row('n2', 'robustness_noise', 'noise', 'white_snr20', 'reject', 'reject', -1.0),
+            _rob_row('n3', 'robustness_noise', 'noise', 'babble_snr0', 'accept', 'reject', -0.5),
+            _rob_row('n4', 'robustness_noise', 'noise', 'babble_snr0', 'reject', 'reject', -1.2),
+            # Duration axis
+            _rob_row('d1', 'robustness_duration', 'duration', 'dur_1.0s', 'accept', 'uncertain', 0.1),
+            _rob_row('d2', 'robustness_duration', 'duration', 'dur_1.0s', 'reject', 'accept', 1.2),
+            # Channel axis
+            _rob_row('c1', 'robustness_channel', 'channel', 'tel8k_ulaw', 'accept', 'accept', 2.0),
+            _rob_row('c2', 'robustness_channel', 'channel', 'tel8k_ulaw', 'reject', 'reject', -0.8),
+            # Reverb axis
+            _rob_row('r1', 'robustness_reverb', 'reverb', 'rt60_0.3s', 'accept', 'accept', 2.2),
+            _rob_row('r2', 'robustness_reverb', 'reverb', 'rt60_0.3s', 'reject', 'reject', -0.9),
+            # Mixture axis (accept-only identification style -> EER is None)
+            _rob_row('m1', 'robustness_mixture', 'mixture', 'mix2_0db_8k', 'accept', 'accept', None),
+        ]
+
+        with patched_dpapi():
+            res = evaluate_robustness(rows, baseline_verify_accuracy=1.0)
+
+        self.assertEqual(set(res['by_axis'].keys()), {'noise', 'duration', 'channel', 'reverb', 'mixture'})
+        self.assertEqual(
+            set(res['by_variant'].keys()),
+            {'white_snr20', 'babble_snr0', 'dur_1.0s', 'tel8k_ulaw', 'rt60_0.3s', 'mix2_0db_8k'},
+        )
+        self.assertAlmostEqual(res['by_variant']['white_snr20']['accuracy'], 1.0, places=6)
+        self.assertAlmostEqual(res['by_variant']['white_snr20']['acc_drop'], 0.0, places=6)
+        self.assertEqual(res['by_variant']['white_snr20']['eer'], 0.0)
+        self.assertAlmostEqual(res['by_variant']['babble_snr0']['accuracy'], 0.5, places=6)
+        self.assertAlmostEqual(res['by_variant']['babble_snr0']['acc_drop'], 0.5, places=6)
+        self.assertAlmostEqual(res['by_variant']['dur_1.0s']['accuracy'], 0.0, places=6)
+        self.assertGreater(res['by_variant']['dur_1.0s']['eer'], 0.5)
+        self.assertIsNone(res['by_variant']['mix2_0db_8k']['eer'])
+        self.assertAlmostEqual(res['by_axis']['noise']['accuracy'], 0.75, places=6)
+        self.assertAlmostEqual(res['worst_drop'], 1.0, places=6)
+        self.assertTrue(res['fault_recovery']['passed'])
+        self.assertTrue(res['consistency']['passed'])
+
+        with patched_dpapi():
+            no_base = evaluate_robustness(rows, baseline_verify_accuracy=None)
+        self.assertIsNone(no_base['worst_drop'])
+        self.assertIsNone(no_base['by_variant']['white_snr20']['acc_drop'])
+
+
+class AuditUpgradeTests(unittest.TestCase):
+    def test_audit_run_all_passes_with_dim_checks_and_catches_corruptions(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from tests._helpers import patched_dpapi
+        from voice_eval import audit
+
+        with patched_dpapi():
+            ok_res = audit.run_all()
+            self.assertTrue(ok_res['ok'], ok_res)
+            self.assertEqual(ok_res['errors'], [])
+            self.assertEqual(audit.dim_checks(), [])
+
+            # Negative subtest 1: corrupt EER calculation caught by dim_checks / run_all
+            with patch('voice_eval.dims.task.compute_eer', return_value=(0.9, 0.5)):
+                bad_eer = audit.run_all()
+            self.assertFalse(bad_eer['ok'])
+            self.assertTrue(bad_eer['errors'])
+
+            # Negative subtest 2: corrupt protocol.json caught by dim_checks / run_all
+            with tempfile.TemporaryDirectory() as tmp:
+                bad_proto = Path(tmp) / 'protocol.json'
+                bad_proto.write_text(json.dumps({'case_version': 2, 'dimensions': ['task']}), encoding='utf-8')
+                with patch.object(audit, 'PROTOCOL_PATH', bad_proto):
+                    bad_proto_res = audit.run_all()
+            self.assertFalse(bad_proto_res['ok'])
+            self.assertTrue(bad_proto_res['errors'])
+
+
 if __name__ == '__main__':
     unittest.main()
