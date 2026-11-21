@@ -10,7 +10,8 @@ from pathlib import Path
 
 import numpy as np
 
-from voiceprint.audio import AudioError, check_audio, duration_seconds, file_digest
+from voiceprint.audio import AudioError, MIN_SECONDS, check_audio, duration_seconds, file_digest
+from voiceprint.audio_quality import analyze_audio_quality
 from voiceprint.embed import cohort_matrix
 from voiceprint.scoring import decide, profile_for
 from voiceprint.security import apply_projection, projection, undo_projection
@@ -75,6 +76,7 @@ class VoiceAgent:
             '撤销': self._ask_revoke, '确认撤销': self._confirm_revoke,
             '轮换密钥': self._rotate, '漂移': self._drift,
             '分离再辨认': self._separate_and_identify, '分离': self._separate,
+            '质检': self._quality,
         }
         try:
             tokens = shlex.split(text, posix=True)
@@ -133,6 +135,16 @@ class VoiceAgent:
             paths = [self._audio(p) for p in paths]
         except AudioError as exc:
             return self._reply('enroll', False, {}, str(exc))
+        for p in paths:
+            q_rep = analyze_audio_quality(p)
+            enroll_issues = [r for r in q_rep.reject_reasons if r in ('empty', 'silence', 'clipping')]
+            if enroll_issues:
+                return self._reply(
+                    'enroll',
+                    False,
+                    {'decision': 'reject', 'reason': 'poor_audio_quality', 'quality_reasons': enroll_issues},
+                    f'拒绝：注册录音质量不达标（{", ".join(enroll_issues)}），请重新录制。',
+                )
         if len({file_digest(p) for p in paths}) < len(paths):
             return self._reply('enroll', False, {'decision': 'reject', 'reason': 'duplicate'},
                                '有内容完全相同的录音。请提供至少 3 段不同的录音。')
@@ -176,6 +188,14 @@ class VoiceAgent:
             path = self._audio(path)
         except AudioError as exc:
             return self._reply('verify', False, {}, str(exc))
+        q_rep = analyze_audio_quality(path)
+        if q_rep.active_seconds + 1e-8 < MIN_SECONDS or 'empty' in q_rep.reject_reasons:
+            return self._reply(
+                'verify',
+                False,
+                {'decision': 'reject', 'reason': 'poor_audio_quality'},
+                '拒绝：录音中有效语音不足或无效，请重新录制。',
+            )
         score = self._score(name, self.embedder.embed_file(path), task='verify')
         self.store.event(name, 'verify', score['score'], score['decision'])
         if self.detail:
@@ -202,6 +222,14 @@ class VoiceAgent:
             path = self._audio(rest[0])
         except AudioError as exc:
             return self._reply('identify', False, {}, str(exc))
+        q_rep = analyze_audio_quality(path)
+        if q_rep.active_seconds + 1e-8 < MIN_SECONDS or 'empty' in q_rep.reject_reasons:
+            return self._reply(
+                'identify',
+                False,
+                {'decision': 'reject', 'reason': 'poor_audio_quality'},
+                '拒绝：录音中有效语音不足或无效，请重新录制。',
+            )
         probe = self.embedder.embed_file(path)
         ranked = []
         for name in names:
@@ -322,6 +350,22 @@ class VoiceAgent:
         result = separate_file(path, self.separated_dir)
         return self._reply('separate', True, {'paths': result['paths']},
                            '已分离成两路（8 kHz）：' + ' 和 '.join(result['paths']))
+
+    def _quality(self, rest: list[str]) -> dict:
+        if len(rest) != 1:
+            return self._reply('quality', False, {}, '用法：质检 "录音路径"')
+        try:
+            path = self._audio(rest[0])
+        except AudioError as exc:
+            return self._reply('quality', False, {}, str(exc))
+        report = analyze_audio_quality(path)
+        summary = '通过' if report.passed_enroll_quality else f'未通过（{", ".join(report.reject_reasons)}）'
+        return self._reply(
+            'quality',
+            True,
+            report.to_dict(),
+            f'录音质检{summary}：时长 {report.duration:.2f}s，有效语音 {report.active_seconds:.2f}s，削波占比 {report.clipping_ratio:.1%}。',
+        )
 
     def _score(self, name: str, probe: np.ndarray, task: str = 'verify') -> dict:
         seed, segments = self.store.load_speaker(name, *self.model)
