@@ -182,3 +182,60 @@ def mix_two_speakers(
     if peak > 0.9:
         mix = mix * (0.9 / peak)
     return mix.astype(np.float32), int(target_sr)
+
+
+def apply_watermark_spoof(
+    wav: np.ndarray,
+    sr: int,
+    *,
+    payload: int = 0x5653,
+    strength: float = 0.02,
+) -> np.ndarray:
+    """Embed a deterministic 16-bit provenance watermark simulating watermarked TTS voice cloning."""
+    from voiceprint.spoof import embed_spread_watermark
+
+    return embed_spread_watermark(wav, int(sr), payload=payload, strength=strength)
+
+
+def apply_vocoder_replay_spoof(
+    wav: np.ndarray,
+    sr: int,
+    *,
+    seed: int = 0,
+) -> np.ndarray:
+    """Simulate deterministic band-limited replay + metallic comb/phase vocoder distortion."""
+    from scipy.signal import butter, sosfiltfilt
+
+    if sr <= 0:
+        raise ValueError(f'invalid sample rate: {sr}')
+    sig = _to_mono_f64(wav)
+    n = sig.shape[0]
+    if n < 32:
+        return np.clip(sig, -1.0, 1.0).astype(np.float32)
+
+    rng = np.random.default_rng(int(seed))
+    nyq = 0.5 * float(sr)
+    low = min(300.0, nyq * 0.25)
+    high = min(3400.0, nyq * 0.85)
+    sos = butter(4, [low, high], btype='bandpass', fs=float(sr), output='sos')
+    out = sosfiltfilt(sos, sig)
+
+    # Short comb resonance + subtle spectral phase jitter.
+    delay = int(rng.integers(19, 38))
+    if delay < n:
+        comb = out.copy()
+        comb[delay:] += 0.35 * out[:-delay]
+        out = comb
+
+    spec = np.fft.rfft(out)
+    jitter = rng.uniform(-0.35, 0.35, size=spec.shape[0])
+    jitter[0] = 0.0
+    if spec.shape[0] > 1:
+        jitter[-1] = 0.0
+    out = np.fft.irfft(spec * np.exp(1j * jitter), n=n)
+
+    in_rms = _rms(sig)
+    out_rms = _rms(out)
+    if in_rms > 1e-12 and out_rms > 1e-12:
+        out = out * (in_rms / out_rms)
+    return np.clip(out, -1.0, 1.0).astype(np.float32)

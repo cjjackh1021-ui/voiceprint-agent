@@ -10,9 +10,10 @@ from pathlib import Path
 
 import numpy as np
 
-from voiceprint.audio import AudioError, MIN_SECONDS, check_audio, duration_seconds, file_digest
+from voiceprint.audio import AudioError, MIN_SECONDS, check_audio, duration_seconds, file_digest, load_wav
 from voiceprint.audio_quality import analyze_audio_quality
 from voiceprint.embed import cohort_matrix
+from voiceprint.features import SR
 from voiceprint.scoring import decide, profile_for
 from voiceprint.security import apply_projection, projection, undo_projection
 from voiceprint.store import Store
@@ -35,15 +36,17 @@ NAME_MAX = 64
 
 class VoiceAgent:
     def __init__(self, data_dir: str | Path, embedder, detail: bool = False,
-                 audio_roots: list[str | Path] | None = None):
+                 audio_roots: list[str | Path] | None = None, spoof_detector=None):
         """detail: put exact scores in replies and results (evaluation, local study).
-        audio_roots: when given, recordings are only read from inside these folders."""
+        audio_roots: when given, recordings are only read from inside these folders.
+        spoof_detector: optional SpoofDetector guarding enroll/verify/identify."""
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.embedder = embedder
         self.model = (embedder.name, embedder.model_id)
         self.profile = profile_for(embedder.name)
         self.detail = detail
+        self.spoof_detector = spoof_detector
         self.separated_dir = self.data_dir / 'separated'
         self.audio_roots = [Path(root) for root in audio_roots] + [self.separated_dir] if audio_roots else None
         self.store = Store(self.data_dir / 'voice.db', self.data_dir / 'master.key')
@@ -119,6 +122,20 @@ class VoiceAgent:
     def _audio(self, path: str) -> str:
         return str(check_audio(path, self.audio_roots))
 
+    def _check_spoof(self, path: str, tool: str) -> dict | None:
+        if self.spoof_detector is None:
+            return None
+        wav = load_wav(path)
+        res = self.spoof_detector.detect(wav, SR)
+        if not res.is_spoof:
+            return None
+        payload: dict = {'decision': 'reject', 'reason': 'spoof_detected'}
+        if self.detail:
+            payload['detector'] = res.detector
+            payload['spoof_score'] = float(res.score)
+            payload['spoof_reason'] = res.reason
+        return self._reply(tool, False, payload, '拒绝：检测到疑似合成或水印伪造语音。')
+
     def _enroll(self, rest: list[str]) -> dict:
         if len(rest) < 5 or rest[1] != '本人同意':
             return self._reply('enroll', False, {}, '注册需要姓名、本人同意，以及至少 3 段录音。')
@@ -145,6 +162,9 @@ class VoiceAgent:
                     {'decision': 'reject', 'reason': 'poor_audio_quality', 'quality_reasons': enroll_issues},
                     f'拒绝：注册录音质量不达标（{", ".join(enroll_issues)}），请重新录制。',
                 )
+            spoof_block = self._check_spoof(p, 'enroll')
+            if spoof_block is not None:
+                return spoof_block
         if len({file_digest(p) for p in paths}) < len(paths):
             return self._reply('enroll', False, {'decision': 'reject', 'reason': 'duplicate'},
                                '有内容完全相同的录音。请提供至少 3 段不同的录音。')
@@ -196,6 +216,9 @@ class VoiceAgent:
                 {'decision': 'reject', 'reason': 'poor_audio_quality'},
                 '拒绝：录音中有效语音不足或无效，请重新录制。',
             )
+        spoof_block = self._check_spoof(path, 'verify')
+        if spoof_block is not None:
+            return spoof_block
         score = self._score(name, self.embedder.embed_file(path), task='verify')
         self.store.event(name, 'verify', score['score'], score['decision'])
         if self.detail:
@@ -230,6 +253,9 @@ class VoiceAgent:
                 {'decision': 'reject', 'reason': 'poor_audio_quality'},
                 '拒绝：录音中有效语音不足或无效，请重新录制。',
             )
+        spoof_block = self._check_spoof(path, 'identify')
+        if spoof_block is not None:
+            return spoof_block
         probe = self.embedder.embed_file(path)
         ranked = []
         for name in names:
