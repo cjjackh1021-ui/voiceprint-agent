@@ -170,6 +170,53 @@ class TestContainedSubprocessAndWorker(unittest.TestCase):
                     iso.embed_file(str(ok_wav))
                 self.assertEqual(iso.restart_count, restarts_before)
 
+    def test_isolated_embedder_rejects_after_close_and_counts_malformed_vec_failures(self):
+        bad_vec_script = (
+            "import base64, json, sys, numpy as np\n"
+            "for line in sys.stdin:\n"
+            "    req = json.loads(line)\n"
+            "    op = req.get('op')\n"
+            "    if op == 'describe':\n"
+            "        print(json.dumps({'ok': True, 'describe': {'embedder': 'badvec', 'dim': 8, 'checkpoint': None, 'model_id': 'badvec-v1', 'cohort_size': 0}, 'rss_mb': 10.0}), flush=True)\n"
+            "    elif op == 'embed':\n"
+            "        p = req['path']\n"
+            "        if 'wrongdim' in p:\n"
+            "            vec = np.zeros(3, dtype=np.float32)\n"
+            "            print(json.dumps({'ok': True, 'vec_b64': base64.b64encode(vec.tobytes()).decode('ascii'), 'dim': 3, 'rss_mb': 10.0}), flush=True)\n"
+            "        else:\n"
+            "            print(json.dumps({'ok': True, 'vec_b64': '!!!not-valid-b64!!!', 'dim': 8, 'rss_mb': 10.0}), flush=True)\n"
+            "    elif op == 'shutdown':\n"
+            "        print(json.dumps({'ok': True}), flush=True)\n"
+            "        break\n"
+        )
+        with TemporaryDirectory(prefix='vpiso_close_') as tmp:
+            root = Path(tmp)
+            script = root / 'badvec_worker.py'
+            script.write_text(bad_vec_script, encoding='utf-8')
+            w_wrong = generate_speaker_wav(root / 'wrongdim.wav', speaker_index=0, duration=1.5, seed=0)
+            w_corrupt = generate_speaker_wav(root / 'corrupt.wav', speaker_index=0, duration=1.5, seed=1)
+
+            # 1. Closed embedder must refuse calls and NEVER spawn a new worker subprocess
+            iso_closed = IsolatedEmbedder('tone', timeout_s=10.0)
+            iso_closed.close()
+            with self.assertRaises(IsolatedWorkerError):
+                iso_closed.embed_file(str(w_wrong))
+            self.assertIsNone(iso_closed._proc)
+
+            # 2. Wrong dim & malformed base64 must route through _handle_failure and trip circuit breaker
+            with IsolatedEmbedder(
+                'badvec',
+                timeout_s=5.0,
+                max_consecutive_failures=2,
+                worker_cmd=[sys.executable, str(script)],
+            ) as iso_bad:
+                with self.assertRaises(IsolatedWorkerError):
+                    iso_bad.embed_file(str(w_wrong))
+                self.assertEqual(iso_bad.restart_count, 1)
+                with self.assertRaises(WorkerCircuitOpenError):
+                    iso_bad.embed_file(str(w_corrupt))
+                self.assertTrue(iso_bad.circuit_open)
+
 
 if __name__ == '__main__':
     unittest.main()

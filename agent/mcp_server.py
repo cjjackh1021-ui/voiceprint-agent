@@ -202,7 +202,7 @@ class VoiceprintMCPServer:
     def _ephemeral_roots(self, extra_dirs: list[Path]):
         orig_roots = self.agent.audio_roots
         try:
-            if extra_dirs:
+            if self.audio_roots or extra_dirs:
                 base = list(self.audio_roots) + [self.agent.separated_dir] + list(extra_dirs)
                 self.agent.audio_roots = base
             yield
@@ -256,8 +256,10 @@ class VoiceprintMCPServer:
             spk = str(args.get('name') or '').strip()
             if not spk:
                 return _tool_response({'ok': False, 'error': 'invalid_arguments', 'reply': '缺少 name 参数。'}, is_error=True)
-            confirm = bool(args.get('confirm', False))
-            cmd = f'确认撤销 {shlex.quote(spk)}' if confirm else f'撤销 {shlex.quote(spk)}'
+            confirm = args.get('confirm', False)
+            if not isinstance(confirm, bool):
+                return _tool_response({'ok': False, 'error': 'invalid_arguments', 'reply': 'confirm 必须为布尔值。'}, is_error=True)
+            cmd = f'确认撤销 {shlex.quote(spk)}' if confirm is True else f'撤销 {shlex.quote(spk)}'
             out = self.agent.handle(cmd)
             return _tool_response(out, is_error=not out['ok'])
 
@@ -300,10 +302,12 @@ class VoiceprintMCPServer:
 
         if name == 'voiceprint_enroll':
             spk = str(args.get('name') or '').strip()
-            consent = bool(args.get('consent', False))
+            consent = args.get('consent', False)
             if not spk:
                 return _tool_response({'ok': False, 'error': 'invalid_arguments', 'reply': '缺少 name 参数。'}, is_error=True)
-            if not consent:
+            if not isinstance(consent, bool):
+                return _tool_response({'ok': False, 'error': 'invalid_arguments', 'reply': 'consent 必须为布尔值。'}, is_error=True)
+            if consent is not True:
                 return _tool_response({'ok': False, 'error': 'consent_required', 'reply': '注册必须获得本人明确同意（consent=true）。'}, is_error=True)
 
             raw_paths = args.get('audio_paths')
@@ -323,7 +327,8 @@ class VoiceprintMCPServer:
                 if not isinstance(raw_paths, list):
                     return _tool_response({'ok': False, 'error': 'invalid_arguments', 'reply': 'audio_paths 必须为字符串列表。'}, is_error=True)
                 quoted = ' '.join(shlex.quote(str(p)) for p in raw_paths)
-                out = self.agent.handle(f'注册 {shlex.quote(spk)} 本人同意 {quoted}')
+                with self._ephemeral_roots([]):
+                    out = self.agent.handle(f'注册 {shlex.quote(spk)} 本人同意 {quoted}')
                 return _tool_response(out, is_error=not out['ok'])
 
             if not isinstance(raw_b64, list):
@@ -362,16 +367,27 @@ class VoiceprintMCPServer:
         return _tool_response({'ok': False, 'error': 'unknown_tool', 'reply': f'未知工具：{name}'}, is_error=True)
 
     def handle_request(self, message: dict) -> dict | None:
-        if not isinstance(message, dict) or message.get('jsonrpc') != '2.0':
+        if not isinstance(message, dict):
             return _jsonrpc_err(None, -32600, 'Invalid JSON-RPC 2.0 request')
+        raw_id = message.get('id')
+        safe_id = raw_id if isinstance(raw_id, (str, int, type(None))) and not isinstance(raw_id, bool) else None
+        if message.get('jsonrpc') != '2.0':
+            return _jsonrpc_err(safe_id, -32600, 'Invalid JSON-RPC 2.0 request')
 
         method = message.get('method')
-        req_id = message.get('id')
-        params = message.get('params') or {}
+        req_id = safe_id
 
         # Notifications have no 'id' and must produce no response.
         if 'id' not in message:
             return None
+
+        raw_params = message.get('params')
+        if raw_params is None:
+            params: dict = {}
+        elif isinstance(raw_params, dict):
+            params = raw_params
+        else:
+            return _jsonrpc_err(req_id, -32602, 'Invalid params: must be an object')
 
         if method == 'initialize':
             return _jsonrpc_ok(req_id, {
@@ -424,7 +440,13 @@ class VoiceprintMCPServer:
             except json.JSONDecodeError:
                 resp = _jsonrpc_err(None, -32700, 'Parse error')
             else:
-                resp = self.handle_request(msg)
+                try:
+                    resp = self.handle_request(msg)
+                except Exception as exc:
+                    logging.getLogger(SERVER_NAME).exception('Unhandled MCP request error')
+                    raw_id = msg.get('id') if isinstance(msg, dict) else None
+                    safe_id = raw_id if isinstance(raw_id, (str, int, type(None))) and not isinstance(raw_id, bool) else None
+                    resp = _jsonrpc_err(safe_id, -32603, f'Internal error: {type(exc).__name__}')
             if resp is not None:
                 out_stream.write(json.dumps(resp, ensure_ascii=False) + '\n')
                 out_stream.flush()

@@ -9,11 +9,11 @@ import shlex
 from pathlib import Path
 
 import numpy as np
+import soundfile as sf
 
-from voiceprint.audio import AudioError, MIN_SECONDS, check_audio, duration_seconds, file_digest, load_wav
+from voiceprint.audio import AudioError, MIN_SECONDS, check_audio, duration_seconds, file_digest
 from voiceprint.audio_quality import analyze_audio_quality
 from voiceprint.embed import cohort_matrix
-from voiceprint.features import SR
 from voiceprint.scoring import decide, profile_for
 from voiceprint.security import apply_projection, projection, undo_projection
 from voiceprint.store import Store
@@ -125,8 +125,9 @@ class VoiceAgent:
     def _check_spoof(self, path: str, tool: str) -> dict | None:
         if self.spoof_detector is None:
             return None
-        wav = load_wav(path)
-        res = self.spoof_detector.detect(wav, SR)
+        info = sf.info(path)
+        wav, sr = sf.read(path, frames=int(30.0 * info.samplerate), dtype='float32', always_2d=False)
+        res = self.spoof_detector.detect(wav, int(sr))
         if not res.is_spoof:
             return None
         payload: dict = {'decision': 'reject', 'reason': 'spoof_detected'}

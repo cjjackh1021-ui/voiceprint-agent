@@ -276,6 +276,101 @@ class TestMCPServer(unittest.TestCase):
             finally:
                 server.agent.close()
 
+    def test_direct_mcp_server_instantiation_enforces_audio_roots(self):
+        from agent.service import VoiceAgent
+
+        embedder = ToneEmbedder()
+        with patched_dpapi(), sandbox_cohort(embedder), TemporaryDirectory(prefix='vpmcp_dir_') as tmp:
+            root = Path(tmp)
+            allowed = root / 'allowed'
+            outside = root / 'outside'
+            allowed.mkdir()
+            outside.mkdir()
+            takes = sandbox_enroll_takes(outside, 'out_jia', speaker_index=0)
+            out_wav = takes[0]
+
+            # VoiceAgent constructed with audio_roots=None, wrapped by VoiceprintMCPServer(audio_roots=[allowed])
+            agent = VoiceAgent(root / 'db', embedder, detail=False, audio_roots=None)
+            server = VoiceprintMCPServer(agent, audio_roots=[allowed])
+            try:
+                q_resp = _call_tool(server, 'voiceprint_check_audio_quality', {'audio_path': str(out_wav)})
+                self.assertTrue(q_resp['result'].get('isError'))
+                self.assertIn('允许的目录', _parse_tool_payload(q_resp)['reply'])
+
+                e_resp = _call_tool(server, 'voiceprint_enroll', {
+                    'name': '甲',
+                    'consent': True,
+                    'audio_paths': [str(p) for p in takes],
+                })
+                self.assertTrue(e_resp['result'].get('isError'))
+                self.assertIn('允许的目录', _parse_tool_payload(e_resp)['reply'])
+                self.assertEqual(agent.store.names(), [])
+            finally:
+                agent.close()
+
+    def test_mcp_rejects_non_bool_string_consent_and_confirm(self):
+        embedder = ToneEmbedder()
+        with patched_dpapi(), sandbox_cohort(embedder), TemporaryDirectory(prefix='vpmcp_bool_') as tmp:
+            root = Path(tmp)
+            allowed = root / 'allowed'
+            allowed.mkdir()
+            takes = sandbox_enroll_takes(allowed, 'jia', speaker_index=0)
+            server = build_default_server(root / 'db', embedder, audio_roots=[allowed])
+            try:
+                # String "false" for consent MUST NOT coerce to True
+                enr_str = _call_tool(server, 'voiceprint_enroll', {
+                    'name': '甲',
+                    'consent': 'false',
+                    'audio_paths': [str(p) for p in takes],
+                })
+                self.assertTrue(enr_str['result'].get('isError'))
+                self.assertEqual(_parse_tool_payload(enr_str)['error'], 'invalid_arguments')
+                self.assertNotIn('甲', server.agent.store.names())
+
+                # Enroll legitimately, enter pending revoke, then pass string "false" for confirm
+                enr_ok = _call_tool(server, 'voiceprint_enroll', {
+                    'name': '甲',
+                    'consent': True,
+                    'audio_paths': [str(p) for p in takes],
+                })
+                self.assertFalse(enr_ok['result'].get('isError', False))
+                rev1 = _call_tool(server, 'voiceprint_revoke', {'name': '甲', 'confirm': False})
+                self.assertFalse(rev1['result'].get('isError', False))
+
+                rev_str = _call_tool(server, 'voiceprint_revoke', {'name': '甲', 'confirm': 'false'})
+                self.assertTrue(rev_str['result'].get('isError'))
+                self.assertEqual(_parse_tool_payload(rev_str)['error'], 'invalid_arguments')
+                self.assertIn('甲', server.agent.store.names())
+            finally:
+                server.agent.close()
+
+    def test_mcp_non_dict_params_returns_jsonrpc_error_without_crashing_stream(self):
+        embedder = ToneEmbedder()
+        with patched_dpapi(), sandbox_cohort(embedder), TemporaryDirectory(prefix='vpmcp_mal_') as tmp:
+            server = build_default_server(Path(tmp) / 'db', embedder)
+            try:
+                requests = [
+                    {'jsonrpc': '1.0', 'id': 9, 'method': 'ping'},
+                    {'jsonrpc': '2.0', 'id': 10, 'method': 'tools/call', 'params': ['list-not-dict']},
+                    {'jsonrpc': '2.0', 'id': 11, 'method': 'resources/read', 'params': 123},
+                    {'jsonrpc': '2.0', 'id': 12, 'method': 'ping'},
+                ]
+                in_buf = io.StringIO('\n'.join(json.dumps(r) for r in requests) + '\n')
+                out_buf = io.StringIO()
+                server.serve_streams(in_buf, out_buf)
+                parsed = [json.loads(ln) for ln in out_buf.getvalue().splitlines() if ln.strip()]
+                self.assertEqual(len(parsed), 4)
+                self.assertEqual(parsed[0]['id'], 9)
+                self.assertEqual(parsed[0]['error']['code'], -32600)
+                self.assertEqual(parsed[1]['id'], 10)
+                self.assertEqual(parsed[1]['error']['code'], -32602)
+                self.assertEqual(parsed[2]['id'], 11)
+                self.assertEqual(parsed[2]['error']['code'], -32602)
+                self.assertEqual(parsed[3]['id'], 12)
+                self.assertIn('result', parsed[3])
+            finally:
+                server.agent.close()
+
 
 if __name__ == '__main__':
     unittest.main()

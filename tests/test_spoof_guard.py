@@ -150,6 +150,46 @@ class TestSpoofGuard(unittest.TestCase):
             finally:
                 agent.close()
 
+    def test_short_055s_to_08s_watermarked_audio_blocked_and_clean_short_allowed(self):
+        embedder = ToneEmbedder()
+        detector = SpreadSpectrumWatermarkDetector()
+        with patched_dpapi(), sandbox_cohort(embedder), TemporaryDirectory(prefix='vpspoof_short_') as tmp:
+            root = Path(tmp)
+            allowed = root / 'allowed'
+            allowed.mkdir()
+            takes = sandbox_enroll_takes(allowed, 'jia', speaker_index=0)
+            agent = VoiceAgent(
+                root / 'db',
+                embedder,
+                detail=False,
+                audio_roots=[allowed],
+                spoof_detector=detector,
+            )
+            try:
+                self.assertTrue(agent.handle(f'注册 甲 本人同意 {quote_paths(takes)}')['ok'])
+                for dur in (0.55, 0.65, 0.80):
+                    clean_p = generate_speaker_wav(
+                        allowed / f'clean_{int(dur * 100)}.wav', speaker_index=0, duration=dur, phase=1.1, seed=int(dur * 100)
+                    )
+                    wav, sr = sf.read(str(clean_p), dtype='float32')
+                    self.assertFalse(detector.detect(wav, sr).is_spoof, f'FP on clean {dur}s clip')
+
+                    wm_p = allowed / f'wm_{int(dur * 100)}.wav'
+                    sf.write(str(wm_p), apply_watermark_spoof(wav, sr), sr)
+
+                    wm_wav, wm_sr = sf.read(str(wm_p), dtype='float32')
+                    det_res = detector.detect(wm_wav, wm_sr)
+                    self.assertTrue(det_res.is_spoof, f'missed watermark on {dur}s clip: {det_res}')
+
+                    v_wm = agent.handle(f'验证 甲 "{wm_p.as_posix()}"')
+                    self.assertFalse(v_wm['ok'], f'VoiceAgent failed to block {dur}s watermarked clip: {v_wm}')
+                    self.assertEqual(v_wm['result'].get('reason'), 'spoof_detected')
+
+                    v_clean = agent.handle(f'验证 甲 "{clean_p.as_posix()}"')
+                    self.assertTrue(v_clean['ok'], f'VoiceAgent falsely blocked clean {dur}s clip: {v_clean}')
+            finally:
+                agent.close()
+
 
 if __name__ == '__main__':
     unittest.main()

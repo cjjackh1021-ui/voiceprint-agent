@@ -1,6 +1,7 @@
 """Subprocess-isolated speaker embedder worker with auto-restart, circuit breaker and RSS reporting."""
 import argparse
 import base64
+import binascii
 import json
 import os
 import queue
@@ -83,6 +84,7 @@ class IsolatedEmbedder(Embedder):
         self.timeout_count = 0
         self.consecutive_failures = 0
         self.circuit_open = False
+        self._closed = False
 
         # Start worker once to fetch authoritative describe() metadata.
         self._start_worker()
@@ -161,6 +163,8 @@ class IsolatedEmbedder(Embedder):
 
     def _rpc(self, request: dict) -> dict:
         with self._lock:
+            if self._closed:
+                raise IsolatedWorkerError('isolated worker has been closed')
             if self.circuit_open:
                 raise WorkerCircuitOpenError('isolated worker circuit breaker is already open')
             if self._proc is None or self._proc.poll() is not None:
@@ -194,25 +198,39 @@ class IsolatedEmbedder(Embedder):
                 self._handle_failure(f'worker reported error: {err_msg}')
 
             self._record_rss(resp.get('rss_mb'))
-            self.consecutive_failures = 0
             return resp
 
     def embed_file(self, path: str) -> np.ndarray:
+        if self._closed:
+            raise IsolatedWorkerError('isolated worker has been closed')
         if self.circuit_open:
             raise WorkerCircuitOpenError('isolated worker circuit breaker is already open')
         return super().embed_file(path)
 
     def _embed(self, path: str) -> np.ndarray:
         resp = self._rpc({'op': 'embed', 'path': str(path)})
-        raw = base64.b64decode(resp['vec_b64'])
-        dim = int(resp.get('dim') or self.dim)
-        vec = np.frombuffer(raw, dtype=np.float32).copy()
-        if vec.shape != (dim,) or not bool(np.all(np.isfinite(vec))):
-            self._handle_failure(f'worker returned invalid embedding shape={vec.shape} expected=({dim},)')
+        try:
+            vec_b64 = resp['vec_b64']
+            if not isinstance(vec_b64, str):
+                raise ValueError('vec_b64 must be a string')
+            raw = base64.b64decode(vec_b64, validate=True)
+            reported_dim = int(resp.get('dim') or 0)
+            expected_dim = self.dim if self.dim > 0 else reported_dim
+            if expected_dim <= 0 or (reported_dim > 0 and reported_dim != expected_dim):
+                raise ValueError(f'dimension mismatch reported={reported_dim} expected={expected_dim}')
+            if len(raw) != expected_dim * 4:
+                raise ValueError(f'byte length mismatch len={len(raw)} expected={expected_dim * 4}')
+            vec = np.frombuffer(raw, dtype=np.float32).copy()
+        except (KeyError, TypeError, ValueError, binascii.Error) as exc:
+            self._handle_failure(f'worker returned malformed embedding payload: {exc}')
+        if vec.shape != (expected_dim,) or not bool(np.all(np.isfinite(vec))):
+            self._handle_failure(f'worker returned invalid embedding shape={vec.shape} expected=({expected_dim},)')
+        self.consecutive_failures = 0
         return vec
 
     def close(self) -> None:
         with self._lock:
+            self._closed = True
             if self._proc is not None and self._proc.poll() is None and self._proc.stdin is not None:
                 try:
                     self._proc.stdin.write(b'{"op": "shutdown"}\n')

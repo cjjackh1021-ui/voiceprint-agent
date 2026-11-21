@@ -10,9 +10,9 @@ from voiceprint.features import SR
 DEFAULT_WATERMARK_PAYLOAD = 0x5653  # 'VS' 16-bit provenance tag
 DEFAULT_WATERMARK_SEED = 20261121
 _N_BITS = 16
-_FRAME_LEN = SR  # 16,000 samples = 1.0s CDMA frame -> 1 Hz FFT resolution
-_BAND_LOW_HZ = 2000.0
-_BAND_HIGH_HZ = 7000.0
+_FRAME_LEN = SR // 2  # 8,000 samples = 0.5s CDMA frame -> matches MIN_SECONDS=0.5s with zero padding
+_BAND_LOW_HZ = 1500.0
+_BAND_HIGH_HZ = 7500.0
 _N_CONTROL_CODES = 32
 
 _CODE_CACHE: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
@@ -137,7 +137,7 @@ class SpreadSpectrumWatermarkDetector(SpoofDetector):
 
     def detect(self, wav: np.ndarray, sr: int) -> SpoofResult:
         sig = _prepare_mono_16k(wav, sr)
-        if sig.size < _FRAME_LEN // 2:
+        if sig.size < _FRAME_LEN:
             return SpoofResult(
                 is_spoof=False,
                 score=0.0,
@@ -154,25 +154,15 @@ class SpreadSpectrumWatermarkDetector(SpoofDetector):
                 metadata={'payload': None},
             )
 
-        # Coherently fold complete/partial 1.0s frames aligned modulo _FRAME_LEN.
-        folded = np.zeros(_FRAME_LEN, dtype=np.float64)
-        counts = np.zeros(_FRAME_LEN, dtype=np.float64)
-        pos = 0
-        while pos < sig.size:
-            take = min(_FRAME_LEN, sig.size - pos)
-            folded[:take] += sig[pos:pos + take]
-            counts[:take] += 1.0
-            pos += take
-        nonzero = counts > 0
-        folded[nonzero] /= counts[nonzero]
-
-        spec = np.fft.rfft(folded)
+        # Coherently sum all complete 0.5s frames before phase whitening: preserves full sqrt(N)
+        # noise-rejection gain while eliminating zero-padding loss on 0.5s-0.99s short clips.
         usable, bit_signs, ctrl_signs = _code_banks(self.secret_seed)
         all_bins = usable.reshape(-1)
+        n_full_frames = sig.size // _FRAME_LEN
+        folded = np.mean(sig[:n_full_frames * _FRAME_LEN].reshape(n_full_frames, _FRAME_LEN), axis=0)
+        spec = np.fft.rfft(folded)
         band_mags = np.abs(spec[all_bins])
         floor = float(np.percentile(band_mags, 25)) * 0.05 + 1e-12
-
-        # Phase-whitened real projection per bit bin cancels narrowband speech harmonics cleanly.
         real_proj = np.real(spec) / (np.abs(spec) + floor)
 
         bit_corrs = np.zeros(_N_BITS, dtype=np.float64)
