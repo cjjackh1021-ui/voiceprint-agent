@@ -34,6 +34,9 @@ def evaluate_all_dimensions(
             cache_stats=perf_data.get('cache_stats'),
             peak_tracemalloc_mb=float(perf_data.get('peak_tracemalloc_mb') or 0.0),
             rss_mb=perf_data.get('rss_mb'),
+            compute_audio_s_list=perf_data.get('compute_audio_s_list'),
+            rtf_bench=perf_data.get('rtf_bench'),
+            worker_rss_mb=perf_data.get('worker_rss_mb'),
         )
 
     redteam_res = evaluate_redteam(security_rows=security_rows)

@@ -11,6 +11,8 @@ from pathlib import Path
 from voice_eval.audit import run_all
 from voice_eval.cases import build
 from voice_eval.gate import compare_reports
+from voice_eval.isolated_worker import IsolatedEmbedder
+from voice_eval.offline import strict_offline_env
 from voice_eval.runner import REPORTS, run_split
 from voiceprint.embed import load_embedder
 
@@ -28,6 +30,9 @@ def main(argv: list[str] | None = None):
     run.add_argument('--split', default='validation', choices=['validation', 'locked', 'both'])
     run.add_argument('--no-cache', action='store_true')
     run.add_argument('--skip-mixture', action='store_true')
+    run.add_argument('--isolate-worker', action='store_true')
+    run.add_argument('--worker-timeout', type=float, default=30.0)
+    run.add_argument('--max-worker-failures', type=int, default=3)
 
     cmp = sub.add_parser('compare')
     cmp.add_argument('--base', default=None)
@@ -68,17 +73,30 @@ def main(argv: list[str] | None = None):
     audit = run_all()
     if not audit['ok']:
         raise SystemExit('评测健康检查失败: ' + '；'.join(audit['errors']))
-    embedder = load_embedder(args.embedder)
     splits = ['validation', 'locked'] if args.split == 'both' else [args.split]
-    for split in splits:
-        path = run_split(
-            embedder,
-            split,
-            with_security=(split == 'validation'),
-            use_cache=not args.no_cache,
-            skip_mixture=args.skip_mixture,
-        )
-        print(path)
+    with strict_offline_env():
+        if args.isolate_worker:
+            embedder = IsolatedEmbedder(
+                args.embedder,
+                timeout_s=args.worker_timeout,
+                max_consecutive_failures=args.max_worker_failures,
+            )
+        else:
+            embedder = load_embedder(args.embedder)
+        try:
+            for split in splits:
+                path = run_split(
+                    embedder,
+                    split,
+                    with_security=(split == 'validation'),
+                    use_cache=not args.no_cache,
+                    skip_mixture=args.skip_mixture,
+                    isolate_worker=args.isolate_worker,
+                )
+                print(path)
+        finally:
+            if hasattr(embedder, 'close'):
+                embedder.close()
 
 
 if __name__ == '__main__':

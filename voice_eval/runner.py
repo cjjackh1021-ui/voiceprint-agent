@@ -13,9 +13,11 @@ from agent.service import VoiceAgent
 from voice_eval.cache import CachedEmbedder
 from voice_eval.cases import case_version, load
 from voice_eval.dims import evaluate_all_dimensions
-from voice_eval.dims.perf import current_rss_mb
+from voice_eval.dims.perf import current_rss_mb, measure_uncached_rtf
 from voice_eval.dims.task import evaluate_task
 from voice_eval.grader import aggregate, grade
+from voice_eval.isolated_worker import IsolatedEmbedder, WorkerCircuitOpenError
+from voice_eval.offline import collect_model_fingerprint, strict_offline_env
 
 ROOT = Path(__file__).resolve().parents[1]
 REPORTS = ROOT / 'reports' / 'voice_eval'
@@ -337,14 +339,39 @@ def _format_summary_markdown(summary: dict) -> str:
         )
 
     cache = perf.get('cache') or {}
+    rtf = perf.get('rtf') or {}
+    audit = summary.get('runtime_audit') or {}
     lines.extend([
         '',
         f"- **缓存命中**: hits={cache.get('hits', 0)}, misses={cache.get('misses', 0)}, hit_rate={_fmt_rate(cache.get('hit_rate'))}",
+        f"- **推理实时率 (RTF)**: warm_rtf={_fmt_rate(rtf.get('warm_rtf'))}, cold_rtf={_fmt_rate(rtf.get('cold_rtf'))}, source={rtf.get('source', 'N/A')}",
         f"- **内存开销**: peak_tracemalloc={perf.get('peak_tracemalloc_mb', 0.0):.2f} MiB, rss={perf['rss_mb']:.2f} MiB"
         if perf.get('rss_mb') is not None
         else f"- **内存开销**: peak_tracemalloc={perf.get('peak_tracemalloc_mb', 0.0):.2f} MiB, rss=N/A",
+        f"- **运行审计**: offline_enforced={bool(audit.get('offline_enforced', False))}, worker_isolated={bool(audit.get('worker_isolated', False))}",
     ])
     return '\n'.join(lines) + '\n'
+
+
+def _extract_sample_audio_paths(cases: list[dict], limit: int = 5) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for case in cases:
+        for step in case.get('steps') or []:
+            try:
+                tokens = shlex.split(step, posix=True)
+            except ValueError:
+                continue
+            for tok in tokens[1:]:
+                if tok in seen:
+                    continue
+                p = Path(tok)
+                if p.suffix.lower() in {'.wav', '.flac', '.ogg', '.mp3'} and p.is_file():
+                    seen.add(tok)
+                    found.append(tok)
+                    if len(found) >= limit:
+                        return found
+    return found
 
 
 def write_report(
@@ -357,6 +384,7 @@ def write_report(
     ver: int | None = None,
     dimensions: dict | None = None,
     skipped_suites: list[str] | None = None,
+    runtime_audit: dict | None = None,
 ) -> Path:
     """Persist cases.jsonl, recompute-verified summary.json, and one-page Chinese summary.md."""
     base_reports = Path(reports_dir) if reports_dir is not None else REPORTS
@@ -403,6 +431,7 @@ def write_report(
         'recomputed_from_jsonl': True,
         'skipped_suites': list(skipped_suites or []),
         'dimensions': dimensions,
+        'runtime_audit': runtime_audit or {},
     }
     (out / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
     (out / 'summary.md').write_text(_format_summary_markdown(summary), encoding='utf-8')
@@ -419,110 +448,153 @@ def run_split(
     cache_dir: Path | None = None,
     use_cache: bool = True,
     skip_mixture: bool = False,
+    offline_strict: bool = True,
+    isolate_worker: bool = False,
 ) -> Path:
-    """Execute a split with caching, telemetry, spot checks, and all 7 evaluation dimensions."""
-    all_cases = load(split, case_dir=case_dir)
-    ver = case_version(case_dir=case_dir)
-    has_mixture = any(c['suite'] == 'robustness_mixture' for c in all_cases)
-    if skip_mixture:
-        cases = [c for c in all_cases if c['suite'] != 'robustness_mixture']
-        skipped_suites = ['robustness_mixture'] if has_mixture else []
-    else:
-        cases = all_cases
-        skipped_suites = []
+    """Execute a split with caching, telemetry, offline audit, Warm RTF, and all 7 dimensions."""
+    from contextlib import nullcontext
 
-    raw_embedder = embedder.inner if isinstance(embedder, CachedEmbedder) else embedder
-    if isinstance(embedder, CachedEmbedder) and cache_dir is None and use_cache == embedder.enabled:
-        active_embedder = embedder
-        active_embedder.reset_stats()
-    else:
-        active_embedder = CachedEmbedder(raw_embedder, cache_dir=cache_dir, enabled=use_cache)
-
-    rows: list[dict] = []
-    case_timings_ms: list[float] = []
-    step_timings_ms: dict[str, list[float]] = {}
-    security_rows: list[dict] = []
-
-    outer_tracing = tracemalloc.is_tracing()
-    if not outer_tracing:
-        tracemalloc.start()
-        base_curr, base_peak = 0, 0
-    else:
-        base_curr, base_peak = tracemalloc.get_traced_memory()
-    max_delta_bytes = 0
-
-    try:
-        progress_step = max(25, len(cases) // 10) if cases else 1
-        for index, case in enumerate(cases, start=1):
-            row = run_case(case, active_embedder, detail=True)
-            rows.append(row)
-            case_timings_ms.append(float(row['latency_ms']))
-            for item in row.get('step_latencies') or []:
-                step_timings_ms.setdefault(item['tool'], []).append(float(item['ms']))
-            if index % progress_step == 0 or index == len(cases):
-                cur_b, peak_b = tracemalloc.get_traced_memory()
-                max_delta_bytes = max(max_delta_bytes, cur_b - base_curr, peak_b - base_peak)
-                print(f'{active_embedder.name} {split} {index}/{len(cases)}', flush=True)
-
-        if with_security:
-            enrolled = {
-                row['id'] for row in rows
-                if row['id'].startswith('verify-accept-') and row['trace'] and row['trace'][0]['ok']
-            }
-            samples = [case for case in cases if case['id'] in enrolled]
-            if len(samples) < 2:
-                security_rows = [_security_row('security-setup', False, '没有两个能注册成功的说话人，安全检查没有运行')]
-            else:
-                enroll = shlex.split(samples[0]['steps'][0], posix=True)[3:]
-                probe = shlex.split(samples[0]['steps'][1], posix=True)[2]
-                other = shlex.split(samples[1]['steps'][0], posix=True)[3:]
-                security_rows = security_cases(active_embedder, enroll, probe, other)
-            rows.extend(security_rows)
-
-        cur_b, peak_b = tracemalloc.get_traced_memory()
-        if not outer_tracing:
-            peak_tracemalloc_mb = peak_b / (1024.0 * 1024.0)
+    ctx_offline = strict_offline_env() if offline_strict else nullcontext()
+    with ctx_offline:
+        all_cases = load(split, case_dir=case_dir)
+        ver = case_version(case_dir=case_dir)
+        has_mixture = any(c['suite'] == 'robustness_mixture' for c in all_cases)
+        if skip_mixture:
+            cases = [c for c in all_cases if c['suite'] != 'robustness_mixture']
+            skipped_suites = ['robustness_mixture'] if has_mixture else []
         else:
-            peak_tracemalloc_mb = max(0, max_delta_bytes, peak_b - base_peak, cur_b - base_curr) / (1024.0 * 1024.0)
+            cases = all_cases
+            skipped_suites = []
 
-        cache_stats = active_embedder.stats()
-        real_non_detail_checks = _collect_real_non_detail_checks(cases, rows, active_embedder)
-    finally:
-        if not outer_tracing and tracemalloc.is_tracing():
-            tracemalloc.stop()
+        orig_raw = embedder.inner if isinstance(embedder, CachedEmbedder) else embedder
+        owned_isolated: IsolatedEmbedder | None = None
+        if isolate_worker and not getattr(orig_raw, 'is_isolated', False):
+            owned_isolated = IsolatedEmbedder(orig_raw.name, checkpoint=orig_raw.checkpoint)
+            raw_embedder = owned_isolated
+        else:
+            raw_embedder = orig_raw
 
-    perf_data = {
-        'case_timings_ms': case_timings_ms,
-        'step_timings_ms': step_timings_ms,
-        'cache_stats': cache_stats,
-        'peak_tracemalloc_mb': peak_tracemalloc_mb,
-        'rss_mb': current_rss_mb(),
-    }
-    dimensions = evaluate_all_dimensions(
-        rows,
-        security_rows=security_rows,
-        real_non_detail_checks=real_non_detail_checks,
-        perf_data=perf_data,
-        skip_flow_separate=skip_mixture,
-    )
-    if skipped_suites:
-        rob = dimensions['robustness']
-        empty_rob = {
-            'n': 0, 'accuracy': None, 'strict_accuracy': None, 'auto_accuracy': None,
-            'false_accept_rate': None, 'false_reject_rate': None, 'review_rate': None,
-            'delivery_rate': None, 'eer': None, 'acc_drop': None, 'skipped': True,
-        }
-        rob['by_axis']['mixture'] = dict(empty_rob)
-        rob['by_variant']['mix2_0db_8k'] = {'axis': 'mixture', **empty_rob}
-        rob['skipped_suites'] = list(skipped_suites)
+        try:
+            model_fp = collect_model_fingerprint(raw_embedder)
+            if not offline_strict:
+                model_fp['offline_enforced'] = False
 
-    return write_report(
-        active_embedder.name,
-        split,
-        rows,
-        active_embedder.describe(),
-        reports_dir=reports_dir,
-        ver=ver,
-        dimensions=dimensions,
-        skipped_suites=skipped_suites,
-    )
+            if isinstance(embedder, CachedEmbedder) and owned_isolated is None and cache_dir is None and use_cache == embedder.enabled:
+                active_embedder = embedder
+                active_embedder.reset_stats()
+            else:
+                active_embedder = CachedEmbedder(raw_embedder, cache_dir=cache_dir, enabled=use_cache)
+
+            rows: list[dict] = []
+            case_timings_ms: list[float] = []
+            step_timings_ms: dict[str, list[float]] = {}
+            security_rows: list[dict] = []
+
+            outer_tracing = tracemalloc.is_tracing()
+            if not outer_tracing:
+                tracemalloc.start()
+                base_curr, base_peak = 0, 0
+            else:
+                base_curr, base_peak = tracemalloc.get_traced_memory()
+            max_delta_bytes = 0
+
+            try:
+                progress_step = max(25, len(cases) // 10) if cases else 1
+                for index, case in enumerate(cases, start=1):
+                    row = run_case(case, active_embedder, detail=True)
+                    if getattr(raw_embedder, 'circuit_open', False):
+                        raise WorkerCircuitOpenError(
+                            f'isolated worker circuit breaker opened during case {case["id"]}'
+                        )
+                    rows.append(row)
+                    case_timings_ms.append(float(row['latency_ms']))
+                    for item in row.get('step_latencies') or []:
+                        step_timings_ms.setdefault(item['tool'], []).append(float(item['ms']))
+                    if index % progress_step == 0 or index == len(cases):
+                        cur_b, peak_b = tracemalloc.get_traced_memory()
+                        max_delta_bytes = max(max_delta_bytes, cur_b - base_curr, peak_b - base_peak)
+                        print(f'{active_embedder.name} {split} {index}/{len(cases)}', flush=True)
+
+                if with_security:
+                    enrolled = {
+                        row['id'] for row in rows
+                        if row['id'].startswith('verify-accept-') and row['trace'] and row['trace'][0]['ok']
+                    }
+                    samples = [case for case in cases if case['id'] in enrolled]
+                    if len(samples) < 2:
+                        security_rows = [_security_row('security-setup', False, '没有两个能注册成功的说话人，安全检查没有运行')]
+                    else:
+                        enroll = shlex.split(samples[0]['steps'][0], posix=True)[3:]
+                        probe = shlex.split(samples[0]['steps'][1], posix=True)[2]
+                        other = shlex.split(samples[1]['steps'][0], posix=True)[3:]
+                        security_rows = security_cases(active_embedder, enroll, probe, other)
+                    rows.extend(security_rows)
+
+                cur_b, peak_b = tracemalloc.get_traced_memory()
+                if not outer_tracing:
+                    peak_tracemalloc_mb = peak_b / (1024.0 * 1024.0)
+                else:
+                    peak_tracemalloc_mb = max(0, max_delta_bytes, peak_b - base_peak, cur_b - base_curr) / (1024.0 * 1024.0)
+
+                cache_stats = active_embedder.stats()
+                compute_audio_s_list = active_embedder.compute_audio_seconds()
+                real_non_detail_checks = _collect_real_non_detail_checks(cases, rows, active_embedder)
+            finally:
+                if not outer_tracing and tracemalloc.is_tracing():
+                    tracemalloc.stop()
+
+            sample_paths = _extract_sample_audio_paths(cases, limit=5)
+            rtf_bench = measure_uncached_rtf(raw_embedder, sample_paths, max_samples=5) if sample_paths else None
+
+            worker_rss_mb = getattr(raw_embedder, 'peak_worker_rss_mb', None)
+            perf_data = {
+                'case_timings_ms': case_timings_ms,
+                'step_timings_ms': step_timings_ms,
+                'cache_stats': cache_stats,
+                'compute_audio_s_list': compute_audio_s_list,
+                'rtf_bench': rtf_bench,
+                'peak_tracemalloc_mb': peak_tracemalloc_mb,
+                'rss_mb': current_rss_mb(),
+                'worker_rss_mb': worker_rss_mb,
+            }
+            dimensions = evaluate_all_dimensions(
+                rows,
+                security_rows=security_rows,
+                real_non_detail_checks=real_non_detail_checks,
+                perf_data=perf_data,
+                skip_flow_separate=skip_mixture,
+            )
+            if skipped_suites:
+                rob = dimensions['robustness']
+                empty_rob = {
+                    'n': 0, 'accuracy': None, 'strict_accuracy': None, 'auto_accuracy': None,
+                    'false_accept_rate': None, 'false_reject_rate': None, 'review_rate': None,
+                    'delivery_rate': None, 'eer': None, 'acc_drop': None, 'skipped': True,
+                }
+                rob['by_axis']['mixture'] = dict(empty_rob)
+                rob['by_variant']['mix2_0db_8k'] = {'axis': 'mixture', **empty_rob}
+                rob['skipped_suites'] = list(skipped_suites)
+
+            runtime_audit = {
+                'offline_enforced': bool(offline_strict),
+                'model_fingerprint': model_fp,
+                'worker_isolated': bool(getattr(raw_embedder, 'is_isolated', False)),
+                'worker_restarts': int(getattr(raw_embedder, 'restart_count', 0)),
+                'worker_timeouts': int(getattr(raw_embedder, 'timeout_count', 0)),
+                'worker_circuit_open': bool(getattr(raw_embedder, 'circuit_open', False)),
+            }
+
+            return write_report(
+                active_embedder.name,
+                split,
+                rows,
+                active_embedder.describe(),
+                reports_dir=reports_dir,
+                ver=ver,
+                dimensions=dimensions,
+                skipped_suites=skipped_suites,
+                runtime_audit=runtime_audit,
+            )
+        finally:
+            if owned_isolated is not None:
+                owned_isolated.close()

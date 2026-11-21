@@ -73,6 +73,8 @@
       "robustness_variant_acc_drop_warn": 0.10,
       "perf_p95_ratio_warn": 1.5,
       "perf_p95_abs_ms_warn": 5.0,
+      "perf_rtf_ratio_warn": 1.5,
+      "perf_rtf_abs_warn": 0.05,
       "peak_mem_ratio_warn": 2.0
     }
   },

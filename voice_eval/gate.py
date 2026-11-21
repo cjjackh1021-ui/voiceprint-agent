@@ -7,6 +7,8 @@ from voice_eval.grader import aggregate, paired_bootstrap
 from voice_eval.runner import REPORTS
 
 REQUIRED_CASE_VERSION = 3
+PERF_RTF_RATIO_WARN = 1.5
+PERF_RTF_ABS_WARN = 0.05
 
 
 def resolve_report_dir(
@@ -140,6 +142,16 @@ def _evaluate_tier3_warnings(base_summary: dict, cand_summary: dict) -> tuple[li
                     f'性能告警：{label} P95 延迟从 {b_p95:.2f} ms 升至 {c_p95:.2f} ms（+{delta:.2f} ms，{ratio:.2f}x）。'
                 )
 
+    b_rtf = (base_perf.get('rtf') or {}).get('warm_rtf')
+    c_rtf = (cand_perf.get('rtf') or {}).get('warm_rtf')
+    if b_rtf is not None and c_rtf is not None and float(b_rtf) > 0.0:
+        rtf_delta = float(c_rtf) - float(b_rtf)
+        rtf_ratio = float(c_rtf) / float(b_rtf)
+        if rtf_ratio > PERF_RTF_RATIO_WARN and rtf_delta > PERF_RTF_ABS_WARN:
+            warnings.append(
+                f'性能告警：Warm RTF 从 {float(b_rtf):.3f} 升至 {float(c_rtf):.3f}（+{rtf_delta:.3f}，{rtf_ratio:.2f}x）。'
+            )
+
     for mem_key, label in (('peak_tracemalloc_mb', '峰值 Tracemalloc 内存'), ('rss_mb', '进程常驻内存 RSS')):
         b_mem = base_perf.get(mem_key)
         c_mem = cand_perf.get(mem_key)
@@ -245,7 +257,7 @@ def _format_compare_markdown(report: dict, base_summary: dict, cand_summary: dic
         f"| Response | passed={bool((base_dims.get('response') or {}).get('passed'))}, leaks={(base_dims.get('response') or {}).get('leak_count', 0)} | passed={bool((cand_dims.get('response') or {}).get('passed'))}, leaks={(cand_dims.get('response') or {}).get('leak_count', 0)} |",
         f"| Flow | passed={bool((base_dims.get('flow') or {}).get('passed'))} ({(base_dims.get('flow') or {}).get('passed_count', 0)}/{(base_dims.get('flow') or {}).get('total', 0)}) | passed={bool((cand_dims.get('flow') or {}).get('passed'))} ({(cand_dims.get('flow') or {}).get('passed_count', 0)}/{(cand_dims.get('flow') or {}).get('total', 0)}) |",
         f"| Redteam | green={(base_dims.get('redteam') or {}).get('green', 0)}, yellow={(base_dims.get('redteam') or {}).get('yellow', 0)}, red={(base_dims.get('redteam') or {}).get('red', 0)} | green={(cand_dims.get('redteam') or {}).get('green', 0)}, yellow={(cand_dims.get('redteam') or {}).get('yellow', 0)}, red={(cand_dims.get('redteam') or {}).get('red', 0)} |",
-        f"| Perf (case P50/P95 ms) | {_fmt(((base_dims.get('perf') or {}).get('case') or {}).get('p50_ms'), 2)} / {_fmt(((base_dims.get('perf') or {}).get('case') or {}).get('p95_ms'), 2)} | {_fmt(((cand_dims.get('perf') or {}).get('case') or {}).get('p50_ms'), 2)} / {_fmt(((cand_dims.get('perf') or {}).get('case') or {}).get('p95_ms'), 2)} |",
+        f"| Perf (case P50/P95 ms / Warm RTF) | {_fmt(((base_dims.get('perf') or {}).get('case') or {}).get('p50_ms'), 2)} / {_fmt(((base_dims.get('perf') or {}).get('case') or {}).get('p95_ms'), 2)} / {_fmt(((base_dims.get('perf') or {}).get('rtf') or {}).get('warm_rtf'), 3)} | {_fmt(((cand_dims.get('perf') or {}).get('case') or {}).get('p50_ms'), 2)} / {_fmt(((cand_dims.get('perf') or {}).get('case') or {}).get('p95_ms'), 2)} / {_fmt(((cand_dims.get('perf') or {}).get('rtf') or {}).get('warm_rtf'), 3)} |",
         f"| Robustness (worst_drop / fault / cons) | {_fmt((base_dims.get('robustness') or {}).get('worst_drop'))} / {_fmt(((base_dims.get('robustness') or {}).get('fault_recovery') or {}).get('recovery_rate'))} / {_fmt(((base_dims.get('robustness') or {}).get('consistency') or {}).get('agreement_rate'))} | {_fmt((cand_dims.get('robustness') or {}).get('worst_drop'))} / {_fmt(((cand_dims.get('robustness') or {}).get('fault_recovery') or {}).get('recovery_rate'))} / {_fmt(((cand_dims.get('robustness') or {}).get('consistency') or {}).get('agreement_rate'))} |",
         '',
         '## 多轴鲁棒性对比（by_axis）',

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from voiceprint.audio import file_digest
+from voiceprint.audio import duration_seconds, file_digest
 from voiceprint.embed import CACHE_LIMIT, Embedder
 
 DEFAULT_CACHE_DIR = Path(__file__).resolve().parent / 'cache'
@@ -26,6 +26,7 @@ class CachedEmbedder(Embedder):
         self._hits = 0
         self._misses = 0
         self._compute_ms: list[float] = []
+        self._compute_audio_s: list[float] = []
         self._lookup_ms: list[float] = []
 
     @property
@@ -125,12 +126,21 @@ class CachedEmbedder(Embedder):
             raise ValueError(f'{self.name} produced invalid embedding of {detail}')
         return arr, compute_ms
 
+    def _record_audio_duration(self, path: str) -> None:
+        try:
+            dur = float(duration_seconds(path))
+            if np.isfinite(dur) and dur > 0.0:
+                self._compute_audio_s.append(dur)
+        except Exception:
+            pass
+
     def embed_file(self, path: str) -> np.ndarray:
         """Return embedding for audio at path, using memory/disk caches when enabled."""
         if not self.enabled:
             arr, compute_ms = self._timed_compute(path)
             self._misses += 1
             self._compute_ms.append(compute_ms)
+            self._record_audio_duration(path)
             return arr.copy()
 
         t0 = time.perf_counter()
@@ -153,7 +163,12 @@ class CachedEmbedder(Embedder):
         self._store_mem(key, arr)
         self._misses += 1
         self._compute_ms.append(compute_ms)
+        self._record_audio_duration(path)
         return arr.copy()
+
+    def compute_audio_seconds(self) -> list[float]:
+        """Return per-miss audio durations in seconds (kept separate from stats() for schema stability)."""
+        return list(self._compute_audio_s)
 
     def stats(self) -> dict:
         """Return cache enabled flag, hit/miss counters, and per-call timing lists."""
@@ -173,4 +188,5 @@ class CachedEmbedder(Embedder):
         self._hits = 0
         self._misses = 0
         self._compute_ms.clear()
+        self._compute_audio_s.clear()
         self._lookup_ms.clear()
