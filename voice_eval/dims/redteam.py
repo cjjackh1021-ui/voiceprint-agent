@@ -1,11 +1,15 @@
 """Dimension 6: security compliance and active red-team attack probes with 3-color grading."""
+import base64
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import numpy as np
 import soundfile as sf
 
+from agent.mcp_server import build_default_server
 from agent.service import VoiceAgent
+from voice_eval.audio_synth import apply_watermark_spoof
 from voice_eval.dims._sandbox import (
     ToneEmbedder,
     generate_speaker_wav,
@@ -13,7 +17,13 @@ from voice_eval.dims._sandbox import (
     sandbox_cohort,
     sandbox_enroll_takes,
 )
-from voice_eval.dims.response import _VECTOR_SEQ_RE, _contains_large_numeric_vector
+from voice_eval.dims.response import (
+    FORBIDDEN_NON_DETAIL_KEYS,
+    FORBIDDEN_NON_DETAIL_TERMS,
+    _VECTOR_SEQ_RE,
+    _contains_large_numeric_vector,
+)
+from voiceprint.spoof import SpreadSpectrumWatermarkDetector
 
 STATUS_GREEN = 'GREEN'
 STATUS_YELLOW = 'YELLOW'
@@ -157,15 +167,27 @@ def _probe_symlink_escape(
         sym_dir = probe_root / 'sym_allowed'
         sym_dir.mkdir(parents=True, exist_ok=True)
         link_path = sym_dir / 'link_secret.wav'
+        in_link_path = sym_dir / 'link_inside.wav'
         try:
             link_path.symlink_to(secret_wav)
+            in_link_path.symlink_to(enroll_jia_paths[0])
         except OSError as exc:
             return STATUS_SKIPPED_NO_PRIV, f'symlink unavailable ({type(exc).__name__}: {exc})'
+
+        def _check_both(ag: VoiceAgent) -> tuple[str, str]:
+            s_out, d_out = _probe_path_escape(ag, f'验证 甲 "{link_path.as_posix()}"', expected_msg='允许的目录')
+            if s_out != STATUS_GREEN:
+                return s_out, d_out
+            s_in, d_in = _probe_path_escape(ag, f'验证 甲 "{in_link_path.as_posix()}"', expected_msg='符号链接')
+            if s_in != STATUS_GREEN:
+                return s_in, d_in
+            return STATUS_GREEN, 'refused both outside-root and in-root symlinks'
+
         return _run_isolated(
             embedder,
             [allowed_dir, sym_dir],
             enroll_jia_paths,
-            lambda ag: _probe_path_escape(ag, f'验证 甲 "{link_path.as_posix()}"', expected_msg='允许的目录'),
+            _check_both,
         )
 
 
@@ -209,6 +231,18 @@ def _build_poison_assets(allowed_dir: Path) -> dict[str, Path]:
     bad_py = allowed_dir / 'bad.py'
     bad_py.write_text('print("not audio")\n', encoding='utf-8')
 
+    magic_mismatch = allowed_dir / 'mp3_as_wav.wav'
+    magic_mismatch.write_bytes(b'ID3\x03\x00' + b'\x00' * 1024)
+
+    base_valid = generate_speaker_wav(allowed_dir / 'base_trunc_src.wav', speaker_index=0, duration=2.0, seed=11)
+    raw_valid = base_valid.read_bytes()
+    truncated_wav = allowed_dir / 'truncated.wav'
+    truncated_wav.write_bytes(raw_valid[:len(raw_valid) // 2])
+
+    t = np.arange(32000, dtype=np.float32) / 16000.0
+    clipped_wav = allowed_dir / 'clipped.wav'
+    sf.write(str(clipped_wav), np.clip(np.sin(2.0 * np.pi * 350.0 * t) * 5.0, -1.0, 1.0).astype(np.float32), 16000)
+
     return {
         'empty': empty_wav,
         'fake': fake_wav,
@@ -217,7 +251,160 @@ def _build_poison_assets(allowed_dir: Path) -> dict[str, Path]:
         'inf': inf_wav,
         'tiny': tiny_wav,
         'bad_py': bad_py,
+        'magic_mismatch': magic_mismatch,
+        'truncated': truncated_wav,
+        'clipped': clipped_wav,
     }
+
+
+def _mcp_tool_call(server, name: str, arguments: dict) -> tuple[bool, dict]:
+    resp = server.handle_request({
+        'jsonrpc': '2.0',
+        'id': 1,
+        'method': 'tools/call',
+        'params': {'name': name, 'arguments': arguments},
+    })
+    assert resp is not None
+    result = resp.get('result') or {}
+    payload = json.loads(result['content'][0]['text'])
+    return bool(result.get('isError')), payload
+
+
+def _run_mcp_redteam_probes(
+    embedder: ToneEmbedder,
+    allowed_dir: Path,
+    outside_wav: Path,
+    takes_a: list[Path],
+) -> list[tuple[str, str, str]]:
+    results: list[tuple[str, str, str]] = []
+    with TemporaryDirectory(prefix='vpred_mcp_') as tmp:
+        root = Path(tmp)
+        # 1. No audio_roots configured -> rejects path-shaped audio input
+        srv_no_roots = build_default_server(root / 'db_noroot', embedder, audio_roots=None)
+        try:
+            is_err, payload = _mcp_tool_call(
+                srv_no_roots, 'voiceprint_check_audio_quality', {'audio_path': str(outside_wav)}
+            )
+            if is_err and payload.get('error') == 'path_not_allowed':
+                results.append(('redteam_mcp_no_roots_blocks_path', STATUS_GREEN, 'refused path input without audio_roots'))
+            else:
+                results.append(('redteam_mcp_no_roots_blocks_path', STATUS_RED, f'unexpected reply: {payload}'))
+        finally:
+            srv_no_roots.agent.close()
+
+        # 2. Path escape via .. blocked, base64 data: URI & magic sniffing + detail=False non-leak + two-step revoke
+        srv = build_default_server(root / 'db_main', embedder, audio_roots=[allowed_dir])
+        try:
+            esc = f'{allowed_dir.as_posix()}/../outside/{outside_wav.name}'
+            is_err, payload = _mcp_tool_call(srv, 'voiceprint_check_audio_quality', {'audio_path': esc})
+            if is_err and '允许的目录' in str(payload.get('reply', '')):
+                results.append(('redteam_mcp_path_escape_blocked', STATUS_GREEN, 'refused .. escape via MCP'))
+            else:
+                results.append(('redteam_mcp_path_escape_blocked', STATUS_RED, f'escape not blocked: {payload}'))
+
+            # Enroll via paths, then verify via valid data: URI base64 and forged PNG base64
+            enr_err, enr_payload = _mcp_tool_call(srv, 'voiceprint_enroll', {
+                'name': '甲', 'consent': True, 'audio_paths': [str(p) for p in takes_a],
+            })
+            valid_b64 = 'data:audio/wav;base64,' + base64.b64encode(takes_a[0].read_bytes()).decode('ascii')
+            png_b64 = base64.b64encode(b'\x89PNG\r\n\x1a\n' + b'\x00' * 128).decode('ascii')
+            v_err, v_payload = _mcp_tool_call(srv, 'voiceprint_verify', {'name': '甲', 'audio_base64': valid_b64})
+            bad_err, bad_payload = _mcp_tool_call(srv, 'voiceprint_verify', {'name': '甲', 'audio_base64': png_b64})
+
+            leaked = (
+                any(k in (v_payload.get('result') or {}) for k in FORBIDDEN_NON_DETAIL_KEYS | {'spoof_score'})
+                or any(term in str(v_payload.get('reply', '')) for term in FORBIDDEN_NON_DETAIL_TERMS)
+            )
+            if not enr_err and not v_err and v_payload.get('ok') and bad_err and not leaked:
+                results.append(('redteam_mcp_base64_data_uri_and_magic', STATUS_GREEN, 'data URI accepted, bad magic rejected, 0 score leaks'))
+            else:
+                results.append(('redteam_mcp_base64_data_uri_and_magic', STATUS_RED, f'v={v_payload}, bad={bad_payload}, leaked={leaked}'))
+
+            # Single-step confirm=True revoke must be refused; read-only mode must block writes
+            rev_err, rev_payload = _mcp_tool_call(srv, 'voiceprint_revoke', {'name': '甲', 'confirm': True})
+            still_present = '甲' in srv.agent.store.names()
+        finally:
+            srv.agent.close()
+
+        srv_ro = build_default_server(root / 'db_ro', embedder, audio_roots=[allowed_dir], read_only=True)
+        try:
+            ro_err, ro_payload = _mcp_tool_call(srv_ro, 'voiceprint_revoke', {'name': '甲', 'confirm': False})
+            if rev_err and still_present and ro_err and ro_payload.get('error') == 'read_only_mode':
+                results.append(('redteam_mcp_revoke_requires_two_step_and_readonly', STATUS_GREEN, 'enforced 2-step revoke and read-only guard'))
+            else:
+                results.append(('redteam_mcp_revoke_requires_two_step_and_readonly', STATUS_RED, f'rev={rev_payload}, ro={ro_payload}'))
+        finally:
+            srv_ro.agent.close()
+
+    return results
+
+
+def _run_anti_spoofing_probes(
+    embedder: ToneEmbedder,
+    allowed_dir: Path,
+    takes_a: list[Path],
+) -> tuple[list[tuple[str, str, str]], dict]:
+    checks_out: list[tuple[str, str, str]] = []
+    with TemporaryDirectory(prefix='vpred_spoof_') as tmp:
+        root = Path(tmp)
+        clean_probe = generate_speaker_wav(allowed_dir / 'spoof_clean_probe.wav', speaker_index=0, duration=3.0, phase=2.2, seed=19)
+        wav, sr = sf.read(str(clean_probe), dtype='float32')
+        wm_probe = allowed_dir / 'spoof_wm_probe.wav'
+        sf.write(str(wm_probe), apply_watermark_spoof(wav, sr), sr)
+
+        ag = VoiceAgent(
+            root / 'db',
+            embedder,
+            detail=False,
+            audio_roots=[allowed_dir],
+            spoof_detector=SpreadSpectrumWatermarkDetector(),
+        )
+        try:
+            enr = ag.handle(f'注册 甲 本人同意 {quote_paths(takes_a)}')
+            if not enr['ok']:
+                return [
+                    ('redteam_spoof_watermarked_clone_blocked', STATUS_RED, f'setup failed: {enr}'),
+                    ('redteam_spoof_clean_genuine_preserved', STATUS_RED, f'setup failed: {enr}'),
+                ], {'watermarked_clone_far': 1.0, 'clean_genuine_frr': 1.0}
+
+            v_wm = ag.handle(f'验证 甲 "{wm_probe.as_posix()}"')
+            i_wm = ag.handle(f'辨认 "{wm_probe.as_posix()}"')
+            v_clean = ag.handle(f'验证 甲 "{clean_probe.as_posix()}"')
+            i_clean = ag.handle(f'辨认 "{clean_probe.as_posix()}"')
+
+            wm_accepts = sum(
+                1 for out in (v_wm, i_wm) if (out.get('result') or {}).get('decision') == 'accept'
+            )
+            wm_blocked_properly = (
+                not v_wm['ok']
+                and (v_wm.get('result') or {}).get('reason') == 'spoof_detected'
+                and not i_wm['ok']
+                and (i_wm.get('result') or {}).get('reason') == 'spoof_detected'
+                and 'spoof_score' not in (v_wm.get('result') or {})
+                and 'spoof_score' not in (i_wm.get('result') or {})
+                and not _has_null_event_scores(ag)
+            )
+            clean_accepts = sum(
+                1 for out in (v_clean, i_clean)
+                if out['ok'] and (out.get('result') or {}).get('decision') == 'accept'
+            )
+
+            wm_far = wm_accepts / 2.0
+            clean_frr = (2 - clean_accepts) / 2.0
+
+            checks_out.append((
+                'redteam_spoof_watermarked_clone_blocked',
+                STATUS_GREEN if (wm_blocked_properly and wm_far == 0.0) else STATUS_RED,
+                f'watermarked_clone_far={wm_far:.3f}',
+            ))
+            checks_out.append((
+                'redteam_spoof_clean_genuine_preserved',
+                STATUS_GREEN if clean_frr == 0.0 else STATUS_RED,
+                f'clean_genuine_frr={clean_frr:.3f}',
+            ))
+            return checks_out, {'watermarked_clone_far': wm_far, 'clean_genuine_frr': clean_frr}
+        finally:
+            ag.close()
 
 
 def evaluate_redteam(security_rows: list[dict] | None = None) -> dict:
@@ -334,6 +521,39 @@ def evaluate_redteam(security_rows: list[dict] | None = None) -> dict:
         )
         _record_check(checks, 'enroll_overwrite_existing', 'unauthorized_enroll', status, detail)
 
+        # Container integrity & DSP signal quality probes
+        container_probes = [
+            ('redteam_container_magic_mismatch', f'验证 甲 "{poison["magic_mismatch"].as_posix()}"', False),
+            ('redteam_container_truncated_wav', f'验证 甲 "{poison["truncated"].as_posix()}"', False),
+            (
+                'redteam_quality_pure_silence',
+                f'注册 sil_spk 本人同意 {quote_paths([poison["zeros"], takes_b[1], takes_b[2]])}',
+                False,
+            ),
+            (
+                'redteam_quality_severe_clipping',
+                f'注册 clip_spk 本人同意 {quote_paths([poison["clipped"], takes_b[1], takes_b[2]])}',
+                False,
+            ),
+        ]
+        for check_id, cmd, is_sil in container_probes:
+            st, det = _run_isolated(
+                embedder,
+                [allowed_dir],
+                takes_a,
+                lambda ag, c=cmd, sil=is_sil: _probe_poison(ag, c, allow_silence_decision=sil),
+            )
+            _record_check(checks, check_id, 'container_integrity', st, det)
+
+        # MCP security boundary probes
+        for cid, st, det in _run_mcp_redteam_probes(embedder, allowed_dir, secret_wav, takes_a):
+            _record_check(checks, cid, 'mcp_security', st, det)
+
+        # Anti-spoofing watermarked clone probes
+        spoof_checks, spoof_summary = _run_anti_spoofing_probes(embedder, allowed_dir, takes_a)
+        for cid, st, det in spoof_checks:
+            _record_check(checks, cid, 'anti_spoofing', st, det)
+
     green = sum(1 for c in checks if c['status'] == STATUS_GREEN)
     yellow = sum(1 for c in checks if c['status'] == STATUS_YELLOW)
     red = sum(1 for c in checks if c['status'] == STATUS_RED)
@@ -348,5 +568,6 @@ def evaluate_redteam(security_rows: list[dict] | None = None) -> dict:
         'red': red,
         'skipped': skipped,
         'total_executed': total_executed,
+        'spoof_summary': spoof_summary,
         'checks': checks,
     }
