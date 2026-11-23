@@ -10,11 +10,14 @@ from pathlib import Path
 
 from voice_eval.audit import run_all
 from voice_eval.cases import build
+from voice_eval.dims._sandbox import ToneEmbedder
+from voice_eval.dims.simulation import evaluate_simulation, write_simulation_report
 from voice_eval.gate import compare_reports
 from voice_eval.isolated_worker import IsolatedEmbedder
 from voice_eval.offline import strict_offline_env
 from voice_eval.runner import REPORTS, run_split
 from voiceprint.embed import load_embedder
+from voiceprint.synth import load_synthesizer
 
 _DEFAULT_REPORTS = REPORTS
 
@@ -40,6 +43,16 @@ def main(argv: list[str] | None = None):
     cmp.add_argument('--out', default=None, type=Path)
     cmp.add_argument('--split', default=None, choices=['validation', 'locked'])
 
+    sim = sub.add_parser('sim-bench')
+    sim.add_argument('--embedder', default='tone', choices=['tone', 'stats', 'vpnet', 'ecapa'])
+    sim.add_argument('--synthesizer', default='acoustic', choices=['acoustic', 'neural_subprocess'])
+    sim.add_argument('--neural-cmd', default=None)
+    sim.add_argument('--neural-timeout', type=float, default=120.0)
+    sim.add_argument('--supported-modes', default='text')
+    sim.add_argument('--max-attempts', type=int, default=3)
+    sim.add_argument('--speakers-limit', type=int, default=4)
+    sim.add_argument('--out', default=None, type=Path)
+
     args = parser.parse_args(argv)
     if args.cmd == 'audit':
         result = run_all()
@@ -47,6 +60,26 @@ def main(argv: list[str] | None = None):
         raise SystemExit(0 if result['ok'] else 1)
     if args.cmd == 'build':
         print(build())
+        return
+    if args.cmd == 'sim-bench':
+        embedder = ToneEmbedder() if args.embedder == 'tone' else load_embedder(args.embedder)
+        modes = tuple(m.strip() for m in str(args.supported_modes).split(',') if m.strip()) or ('text',)
+        synthesizer = load_synthesizer(
+            args.synthesizer,
+            neural_cmd=args.neural_cmd,
+            timeout_s=args.neural_timeout,
+            supported_modes=modes,
+        )
+        assert synthesizer is not None
+        report = evaluate_simulation(
+            embedder,
+            synthesizer,
+            max_attempts=args.max_attempts,
+            speakers_limit=args.speakers_limit,
+        )
+        out_dir = args.out if args.out is not None else REPORTS
+        json_p, md_p = write_simulation_report(report, out_dir)
+        print(f'sim-bench 完成：{json_p} ({md_p})')
         return
     if args.cmd == 'compare':
         default_pair = args.base is None and args.cand is None

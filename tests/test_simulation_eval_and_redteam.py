@@ -7,16 +7,19 @@ import numpy as np
 import soundfile as sf
 
 from tests._helpers import patched_dpapi
+import voice_eval.__main__ as voice_eval_main
 from voice_eval.audio_synth import (
     apply_gain_clip_attack,
     apply_lowpass_attack,
     apply_resample_attack,
     apply_watermark_spoof,
 )
-from voice_eval.dims._sandbox import generate_speaker_wav
+from voice_eval.dims._sandbox import ToneEmbedder, generate_speaker_wav, sandbox_cohort
 from voice_eval.dims.redteam import evaluate_redteam
+from voice_eval.dims.simulation import evaluate_simulation, write_simulation_report
 from voiceprint.features import SR
 from voiceprint.spoof import SpreadSpectrumWatermarkDetector
+from voiceprint.synth import AcousticFormantSynthesizer, SimulationRequest, SimulationResult, VoiceSynthesizer
 
 
 class TestSimulationRedteamAndAttacks(unittest.TestCase):
@@ -77,6 +80,103 @@ class TestSimulationRedteamAndAttacks(unittest.TestCase):
             self.assertIn(cid, by_id, f'missing redteam probe {cid}')
             self.assertEqual(by_id[cid]['category'], 'simulation_security')
             self.assertEqual(by_id[cid]['status'], 'GREEN', f'{cid} failed: {by_id[cid]}')
+
+    def test_evaluate_simulation_tracks_a_and_b_under_tone_embedder(self):
+        embedder = ToneEmbedder()
+        with patched_dpapi(), sandbox_cohort(embedder):
+            rep = evaluate_simulation(
+                embedder,
+                AcousticFormantSynthesizer(),
+                max_attempts=3,
+                speakers_limit=2,
+            )
+        track_a = rep['track_a']
+        track_b = rep['track_b']
+        self.assertGreater(track_a['total_cases'], 0)
+        self.assertGreaterEqual(track_a['convergence_rate'], track_a['attempt1_convergence_rate'])
+        self.assertEqual(track_a['convergence_rate'], 1.0)
+        self.assertGreaterEqual(track_a['final_mean_raw_sim'], track_a['attempt1_mean_raw_sim'] - 1e-4)
+        self.assertGreaterEqual(track_a['final_mean_norm_score'], track_a['attempt1_mean_norm_score'] - 1e-2)
+        self.assertGreaterEqual(track_a['avg_attempts'], 1.0)
+        self.assertEqual(track_a['security_gate_refusal_rate'], 1.0)
+
+        self.assertEqual(track_b['quality_pass_rate'], 1.0)
+        self.assertEqual(track_b['watermark_readback_rate'], 1.0)
+        self.assertEqual(track_b['loopback_spoof_block_rate'], 1.0)
+        expected_attacks = {
+            'white_noise_15db',
+            'white_noise_10db',
+            'duration_crop_0.6s',
+            'lowpass_4500hz',
+            'lowpass_3600hz',
+            'resample_8k_roundtrip',
+            'gain_clip_1.8x',
+        }
+        self.assertEqual(set(track_b['attack_survival'].keys()), expected_attacks)
+        for atk, stats in track_b['attack_survival'].items():
+            self.assertIn('detection_rate', stats, atk)
+            self.assertIn('mean_z_score', stats, atk)
+
+        self.assertGreater(rep['latency_ms']['p50_ms'], 0.0)
+        self.assertGreaterEqual(rep['latency_ms']['p95_ms'], rep['latency_ms']['p50_ms'])
+        self.assertGreater(len(rep['cases']), 0)
+
+    def test_evaluate_simulation_skips_unsupported_audio_mode_gracefully(self):
+        class _TextOnlyEchoTargetSynth(VoiceSynthesizer):
+            name = 'text_only_test'
+            supported_modes = ('text',)
+
+            def synthesize(self, req: SimulationRequest) -> SimulationResult:
+                import soundfile as _sf
+                wav, sr = _sf.read(req.reference_audio_path, dtype='float32')
+                return SimulationResult(wav=wav, sr=int(sr), backend=self.name, metadata={})
+
+        embedder = ToneEmbedder()
+        with patched_dpapi(), sandbox_cohort(embedder):
+            rep = evaluate_simulation(
+                embedder,
+                _TextOnlyEchoTargetSynth(),
+                max_attempts=2,
+                speakers_limit=2,
+            )
+        self.assertGreater(rep['track_a']['skipped_unsupported_cases'], 0)
+        self.assertGreater(rep['track_a']['total_cases'], 0)
+        self.assertTrue(all(c['mode'] == 'text' for c in rep['cases'] if not c.get('skipped')))
+
+    def test_evaluate_simulation_track_b_collects_when_track_a_not_converged(self):
+        class _NonConvergingSynth(VoiceSynthesizer):
+            name = 'non_converging_mock'
+            supported_modes = ('audio', 'text')
+
+            def __init__(self, alien_wav_path: Path):
+                self._wav, self._sr = sf.read(str(alien_wav_path), dtype='float32')
+
+            def synthesize(self, req: SimulationRequest) -> SimulationResult:
+                return SimulationResult(wav=self._wav.copy(), sr=int(self._sr), backend=self.name, metadata={})
+
+        embedder = ToneEmbedder()
+        with patched_dpapi(), sandbox_cohort(embedder), TemporaryDirectory(prefix='vpsimb_nc_') as tmp:
+            alien = generate_speaker_wav(Path(tmp) / 'alien.wav', speaker_index=15, duration=2.5, seed=99)
+            rep = evaluate_simulation(
+                embedder,
+                _NonConvergingSynth(alien),
+                max_attempts=2,
+                speakers_limit=2,
+            )
+        self.assertEqual(rep['track_a']['convergence_rate'], 0.0)
+        self.assertEqual(rep['track_b']['watermark_readback_rate'], 1.0)
+        self.assertEqual(rep['track_b']['loopback_spoof_block_rate'], 1.0)
+        self.assertEqual(len(rep['track_b']['attack_survival']), 7)
+
+    def test_cli_sim_bench_writes_json_and_markdown_reports(self):
+        with TemporaryDirectory(prefix='vpsimcli_') as tmp:
+            voice_eval_main.main(['sim-bench', '--embedder', 'tone', '--synthesizer', 'acoustic', '--max-attempts', '2', '--speakers-limit', '2', '--out', tmp])
+            out_dir = Path(tmp)
+            json_p = out_dir / 'sim_bench_tone_acoustic_formant.json'
+            md_p = out_dir / 'sim_bench_tone_acoustic_formant.md'
+            self.assertTrue(json_p.is_file())
+            self.assertTrue(md_p.is_file())
+            self.assertIn('Track A', md_p.read_text(encoding='utf-8'))
 
 
 if __name__ == '__main__':
