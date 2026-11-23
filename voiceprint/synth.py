@@ -197,7 +197,7 @@ def _smooth_log_envelope(wav: np.ndarray, n_fft: int = _N_FFT, hop: int = _HOP) 
     mean_pow = np.mean(active, axis=0)
     mean_pow = mean_pow / (float(np.mean(mean_pow)) + 1e-12)
     log_env = np.log(mean_pow + 1e-3)
-    return gaussian_filter1d(log_env, sigma=2.5, mode='nearest')
+    return gaussian_filter1d(log_env, sigma=1.0, mode='nearest')
 
 
 def _pitch_shift_preserve_duration(wav: np.ndarray, ratio: float) -> np.ndarray:
@@ -252,7 +252,7 @@ class AcousticFormantSynthesizer(VoiceSynthesizer):
         gain_scale = float(np.clip(req.gain_scale, 0.1, 1.25))
 
         freqs = np.fft.rfftfreq(_N_FFT, d=1.0 / SR)
-        voice_band = ((freqs >= 150.0) & (freqs <= 7600.0)).astype(np.float64)
+        voice_band = ((freqs >= 100.0) & (freqs <= 7800.0)).astype(np.float64)
 
         if req.mode == 'audio':
             if not req.source_audio_path:
@@ -263,12 +263,17 @@ class AcousticFormantSynthesizer(VoiceSynthesizer):
             shifted = _pitch_shift_preserve_duration(src, ratio)
 
             log_env_shifted = _smooth_log_envelope(shifted)
-            delta_log = np.clip(log_env_ref - log_env_shifted, -4.5, 4.5) * formant_blend * voice_band
+            delta_log = np.clip(log_env_ref - log_env_shifted, -5.0, 5.0) * formant_blend * voice_band
             filter_gain = np.exp(0.5 * delta_log)
 
             spec = _stft(shifted)
             morphed_spec = spec * filter_gain[None, :]
+            # Normalize output spectral envelope once more in case phase-vocoder residual tilted slope
             out = _istft(morphed_spec, src.shape[0])
+            if formant_blend > 0.4:
+                log_env_out = _smooth_log_envelope(out)
+                corr_gain = np.exp(0.5 * np.clip(log_env_ref - log_env_out, -3.5, 3.5) * formant_blend * voice_band)
+                out = _istft(_stft(out) * corr_gain[None, :], src.shape[0])
             src_rms = float(np.sqrt(np.mean(src * src))) + 1e-12
             out_rms = float(np.sqrt(np.mean(out * out))) + 1e-12
             out = out * (src_rms * gain_scale / out_rms)
@@ -349,21 +354,24 @@ class AcousticFormantSynthesizer(VoiceSynthesizer):
                 amp_env[pos:end] = 0.02
             pos = end
 
-        # Build broadband harmonic pulse train + controlled unvoiced excitation matching reference F0 spacing
+        # Build broadband harmonic excitation (randomized harmonic phases avoid impulsive Dirac crest)
+        # plus shaped unvoiced breath noise so spread-spectrum watermark bins remain clean.
         phase = 2.0 * np.pi * np.cumsum(inst_f0) / float(SR)
         k_max = max(3, int(min(7500.0, 0.47 * SR) // max(f0_base, 70.0)))
+        harm_phases = rng.uniform(0.0, 2.0 * np.pi, size=k_max)
         harm = np.zeros(total_n, dtype=np.float64)
-        for k in range(1, k_max + 1):
-            harm += np.sin(k * phase + (k * 0.37))
-        harm = harm / max(np.sqrt(k_max), 1.0)
-        noise = rng.standard_normal(total_n) * 0.35
+        for idx_k in range(k_max):
+            harm += np.sin((idx_k + 1) * phase + harm_phases[idx_k])
+        harm = harm / max(float(np.std(harm)), 1e-6)
+        noise = rng.standard_normal(total_n) * 0.65
         exc = (harm * voiced_mask + noise) * amp_env
 
-        # Shape via reference smoothed formant envelope centered around zero mean log-gain
+        # Normalize excitation spectrum against target smoothed formant envelope directly
         freqs = np.fft.rfftfreq(_N_FFT, d=1.0 / SR)
-        voice_band = ((freqs >= 150.0) & (freqs <= 7600.0)).astype(np.float64)
-        env_centered = log_env_ref - float(np.mean(log_env_ref[voice_band > 0]))
-        formant_filter = np.exp(0.55 * formant_blend * np.clip(env_centered, -4.5, 4.5) * voice_band)
+        voice_band = ((freqs >= 120.0) & (freqs <= 7800.0)).astype(np.float64)
+        log_env_exc = _smooth_log_envelope(exc)
+        delta_env = np.clip(log_env_ref - log_env_exc, -5.0, 5.0) * formant_blend * voice_band
+        formant_filter = np.exp(0.5 * delta_env)
 
         spec = _stft(exc)
         shaped = _istft(spec * formant_filter[None, :], total_n)

@@ -239,3 +239,51 @@ def apply_vocoder_replay_spoof(
     if in_rms > 1e-12 and out_rms > 1e-12:
         out = out * (in_rms / out_rms)
     return np.clip(out, -1.0, 1.0).astype(np.float32)
+
+
+def apply_lowpass_attack(wav: np.ndarray, sr: int, cutoff_hz: float = 3600.0) -> np.ndarray:
+    """Zero-phase 4th-order Butterworth low-pass attack targeting high-frequency watermark bins."""
+    from scipy.signal import butter, sosfiltfilt
+
+    if sr <= 0:
+        raise ValueError(f'invalid sample rate: {sr}')
+    nyq = 0.5 * float(sr)
+    cutoff = float(cutoff_hz)
+    if not (0.0 < cutoff < nyq):
+        raise ValueError(f'cutoff_hz must be in (0, {nyq}): {cutoff_hz}')
+    sig = _to_mono_f64(wav)
+    if sig.size < 32:
+        return np.clip(sig, -1.0, 1.0).astype(np.float32)
+    sos = butter(4, cutoff, btype='lowpass', fs=float(sr), output='sos')
+    out = sosfiltfilt(sos, sig)
+    return np.clip(out, -1.0, 1.0).astype(np.float32)
+
+
+def apply_resample_attack(wav: np.ndarray, sr: int, mid_sr: int = 8000) -> np.ndarray:
+    """Roundtrip down/up-sampling degradation attack (e.g., 16 kHz -> 8 kHz -> 16 kHz)."""
+    if sr <= 0 or mid_sr <= 0:
+        raise ValueError(f'sample rates must be positive: sr={sr}, mid_sr={mid_sr}')
+    sig = _to_mono_f64(wav)
+    if sig.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    if int(mid_sr) == int(sr):
+        return np.clip(sig, -1.0, 1.0).astype(np.float32)
+    down = _resample(sig, int(sr), int(mid_sr))
+    up = _resample(down, int(mid_sr), int(sr))
+    if up.shape[0] > sig.shape[0]:
+        up = up[:sig.shape[0]]
+    elif up.shape[0] < sig.shape[0]:
+        up = np.pad(up, (0, sig.shape[0] - up.shape[0]))
+    return np.clip(up, -1.0, 1.0).astype(np.float32)
+
+
+def apply_gain_clip_attack(wav: np.ndarray, sr: int, drive: float = 1.8) -> np.ndarray:
+    """Hard-clipping nonlinear overdrive attack preserving output length."""
+    if sr <= 0:
+        raise ValueError(f'invalid sample rate: {sr}')
+    if float(drive) <= 0.0:
+        raise ValueError(f'drive must be positive: {drive}')
+    sig = _to_mono_f64(wav)
+    if sig.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    return np.clip(sig * float(drive), -1.0, 1.0).astype(np.float32)

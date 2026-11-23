@@ -8,8 +8,9 @@ import numpy as np
 import soundfile as sf
 
 from agent.mcp_server import build_default_server
-from agent.service import VoiceAgent
+from agent.service import LOCK_MINUTES, VoiceAgent
 from voice_eval.audio_synth import apply_watermark_spoof
+from voiceprint.synth import AcousticFormantSynthesizer
 from voice_eval.dims._sandbox import (
     ToneEmbedder,
     generate_speaker_wav,
@@ -407,6 +408,235 @@ def _run_anti_spoofing_probes(
             ag.close()
 
 
+def _run_simulation_probes(
+    embedder: ToneEmbedder,
+    allowed_dir: Path,
+    takes_a: list[Path],
+    takes_b: list[Path],
+) -> list[tuple[str, str, str]]:
+    """Run 6 voice-simulation authorization, ownership, anti-recursive & MCP probes."""
+    checks_out: list[tuple[str, str, str]] = []
+    src_b = generate_speaker_wav(allowed_dir / 'sim_src_b.wav', speaker_index=1, duration=2.5, phase=1.4, seed=29)
+    raw_a, sr_a = sf.read(str(takes_a[0]), dtype='float32')
+    wm_ref = allowed_dir / 'sim_wm_ref.wav'
+    sf.write(str(wm_ref), apply_watermark_spoof(raw_a, sr_a), sr_a)
+
+    # 1. Missing explicit '本人授权'
+    def _probe_missing_consent(ag: VoiceAgent) -> tuple[str, str]:
+        out = ag.handle(f'模拟 甲 同意 "{takes_a[0].as_posix()}" 文本 "无授权尝试"')
+        leak_st, leak_msg = _detect_leak(out)
+        if leak_st:
+            return leak_st, leak_msg
+        if out['ok'] or (out.get('result') or {}).get('reason') != 'consent_required':
+            return STATUS_RED, f'missing consent not properly rejected: {out}'
+        if ag.simulated_dir.exists() and any(ag.simulated_dir.glob('*.wav')):
+            return STATUS_RED, 'audio written without consent'
+        return STATUS_GREEN, 'rejected missing consent without disk output'
+
+    st, det = _run_isolated(embedder, [allowed_dir], takes_a, _probe_missing_consent)
+    checks_out.append(('sim-missing-consent', st, det))
+
+    # 2. Unregistered target speaker
+    def _probe_unregistered(ag: VoiceAgent) -> tuple[str, str]:
+        out = ag.handle(f'模拟 未注册路人 本人授权 "{takes_a[0].as_posix()}" 文本 "冒充未知人"')
+        leak_st, leak_msg = _detect_leak(out)
+        if leak_st:
+            return leak_st, leak_msg
+        if out['ok'] or (out.get('result') or {}).get('reason') != 'unknown':
+            return STATUS_RED, f'unregistered target not rejected cleanly: {out}'
+        return STATUS_GREEN, 'rejected unregistered target'
+
+    st, det = _run_isolated(embedder, [allowed_dir], takes_a, _probe_unregistered)
+    checks_out.append(('sim-unregistered-target', st, det))
+
+    # 3. Cross-speaker impostor reference must fail ownership check without locking target
+    def _probe_cross_speaker(ag: VoiceAgent) -> tuple[str, str]:
+        out = ag.handle(f'模拟 甲 本人授权 "{takes_b[0].as_posix()}" 源音频 "{src_b.as_posix()}"')
+        leak_st, leak_msg = _detect_leak(out)
+        if leak_st:
+            return leak_st, leak_msg
+        if out['ok'] or (out.get('result') or {}).get('reason') != 'reference_speaker_mismatch':
+            return STATUS_RED, f'cross-speaker reference not blocked: {out}'
+        if ag.store.recent_failures('甲', LOCK_MINUTES) != 0:
+            return STATUS_RED, 'simulation ownership refusal polluted verify lockout count'
+        return STATUS_GREEN, 'cross-speaker impostor rejected cleanly with zero lockout pollution'
+
+    st, det = _run_isolated(embedder, [allowed_dir], takes_a, _probe_cross_speaker)
+    checks_out.append(('sim-cross-speaker-impostor', st, det))
+
+    # 4. Recursive cloning of already watermarked audio must be blocked
+    def _probe_recursive(ag: VoiceAgent) -> tuple[str, str]:
+        out = ag.handle(f'模拟 甲 本人授权 "{wm_ref.as_posix()}" 文本 "洗白水印尝试"')
+        leak_st, leak_msg = _detect_leak(out)
+        if leak_st:
+            return leak_st, leak_msg
+        if out['ok'] or (out.get('result') or {}).get('reason') != 'watermark_detected':
+            return STATUS_RED, f'recursive watermarked reference was not blocked: {out}'
+        return STATUS_GREEN, 'recursive watermark cloning blocked'
+
+    st, det = _run_isolated(embedder, [allowed_dir], takes_a, _probe_recursive)
+    checks_out.append(('sim-recursive-watermark-clone', st, det))
+
+    # 5. Legitimate simulation looped back into spoof-guarded verify & identify must be caught
+    with TemporaryDirectory(prefix='vpred_simloop_') as tmp:
+        ag = VoiceAgent(
+            Path(tmp) / 'db',
+            embedder,
+            detail=False,
+            audio_roots=[allowed_dir],
+            spoof_detector=SpreadSpectrumWatermarkDetector(),
+        )
+        try:
+            enr = ag.handle(f'注册 甲 本人同意 {quote_paths(takes_a)}')
+            if not enr['ok']:
+                checks_out.append(('sim-loopback-spoof-blocked', STATUS_RED, f'setup failed: {enr}'))
+            else:
+                sim = ag.handle(f'模拟 甲 本人授权 "{takes_a[0].as_posix()}" 源音频 "{src_b.as_posix()}"')
+                leak_st, leak_msg = _detect_leak(sim)
+                if leak_st:
+                    checks_out.append(('sim-loopback-spoof-blocked', leak_st, leak_msg))
+                elif not sim['ok']:
+                    checks_out.append(('sim-loopback-spoof-blocked', STATUS_RED, f'valid sim failed: {sim}'))
+                else:
+                    sim_wav = (sim.get('result') or {}).get('output_path', '')
+                    ver = ag.handle(f'验证 甲 "{sim_wav}"')
+                    ide = ag.handle(f'辨认 "{sim_wav}"')
+                    blocked = (
+                        not ver['ok']
+                        and (ver.get('result') or {}).get('reason') == 'spoof_detected'
+                        and not ide['ok']
+                        and (ide.get('result') or {}).get('reason') == 'spoof_detected'
+                        and not _has_null_event_scores(ag)
+                    )
+                    checks_out.append((
+                        'sim-loopback-spoof-blocked',
+                        STATUS_GREEN if blocked else STATUS_RED,
+                        'loopback simulated audio intercepted cleanly' if blocked else f'loopback not blocked: ver={ver}, ide={ide}',
+                    ))
+        finally:
+            ag.close()
+
+    # 6. MCP simulation guardrails: read-only block, non-bool consent, no-roots path block, detail=False redaction
+    with TemporaryDirectory(prefix='vpred_simmcp_') as tmp:
+        root = Path(tmp)
+        ro_srv = build_default_server(
+            root / 'ro_db',
+            embedder,
+            audio_roots=[allowed_dir],
+            read_only=True,
+            synthesizer=AcousticFormantSynthesizer(),
+        )
+        rw_noroots = build_default_server(
+            root / 'noroot_db',
+            embedder,
+            audio_roots=None,
+            detail=False,
+            synthesizer=AcousticFormantSynthesizer(),
+        )
+        try:
+            ro_resp = ro_srv.handle_request({
+                'jsonrpc': '2.0',
+                'id': 1,
+                'method': 'tools/call',
+                'params': {
+                    'name': 'voiceprint_simulate',
+                    'arguments': {
+                        'name': '甲',
+                        'consent': True,
+                        'reference_audio_path': str(takes_a[0]),
+                        'text': 'readonly',
+                    },
+                },
+            })
+            ro_payload = json.loads(ro_resp['result']['content'][0]['text'])
+
+            b64_ref = base64.b64encode(takes_a[0].read_bytes()).decode('ascii')
+            enr_resp = rw_noroots.handle_request({
+                'jsonrpc': '2.0',
+                'id': 2,
+                'method': 'tools/call',
+                'params': {
+                    'name': 'voiceprint_enroll',
+                    'arguments': {
+                        'name': '甲',
+                        'consent': True,
+                        'audio_base64_list': [base64.b64encode(p.read_bytes()).decode('ascii') for p in takes_a],
+                        'session_ids': ['s1', 's1', 's2'],
+                    },
+                },
+            })
+            bad_consent_resp = rw_noroots.handle_request({
+                'jsonrpc': '2.0',
+                'id': 3,
+                'method': 'tools/call',
+                'params': {
+                    'name': 'voiceprint_simulate',
+                    'arguments': {
+                        'name': '甲',
+                        'consent': 'true',
+                        'reference_audio_base64': b64_ref,
+                        'text': 'string consent',
+                    },
+                },
+            })
+            path_blocked_resp = rw_noroots.handle_request({
+                'jsonrpc': '2.0',
+                'id': 4,
+                'method': 'tools/call',
+                'params': {
+                    'name': 'voiceprint_simulate',
+                    'arguments': {
+                        'name': '甲',
+                        'consent': True,
+                        'reference_audio_path': str(takes_a[0]),
+                        'text': 'no roots path',
+                    },
+                },
+            })
+            ok_sim_resp = rw_noroots.handle_request({
+                'jsonrpc': '2.0',
+                'id': 5,
+                'method': 'tools/call',
+                'params': {
+                    'name': 'voiceprint_simulate',
+                    'arguments': {
+                        'name': '甲',
+                        'consent': True,
+                        'reference_audio_base64': b64_ref,
+                        'text': '红队安全闭环检查',
+                    },
+                },
+            })
+            bc_payload = json.loads(bad_consent_resp['result']['content'][0]['text'])
+            pb_payload = json.loads(path_blocked_resp['result']['content'][0]['text'])
+            ok_payload = json.loads(ok_sim_resp['result']['content'][0]['text'])
+            sim_res = ok_payload.get('result') or {}
+            no_score_leak = (
+                not FORBIDDEN_NON_DETAIL_KEYS.intersection(sim_res.keys())
+                and not any(term in str(ok_payload.get('reply', '')) for term in FORBIDDEN_NON_DETAIL_TERMS)
+                and not _contains_large_numeric_vector(sim_res)
+            )
+            ok_mcp = (
+                not enr_resp['result'].get('isError', False)
+                and ro_payload.get('error') == 'read_only_mode'
+                and bc_payload.get('error') == 'invalid_arguments'
+                and pb_payload.get('error') == 'path_not_allowed'
+                and bool(ok_payload.get('ok'))
+                and no_score_leak
+            )
+            checks_out.append((
+                'sim-mcp-guardrails',
+                STATUS_GREEN if ok_mcp else STATUS_RED,
+                'MCP simulation read-only, boolean, path and non-detail guards verified'
+                if ok_mcp else f'MCP simulation guard failure: ro={ro_payload}, bc={bc_payload}, pb={pb_payload}, ok={ok_payload}',
+            ))
+        finally:
+            ro_srv.agent.close()
+            rw_noroots.agent.close()
+
+    return checks_out
+
+
 def evaluate_redteam(security_rows: list[dict] | None = None) -> dict:
     """Run active red-team attack probes (sandboxed) merged with optional candidate security_rows."""
     checks: list[dict] = []
@@ -553,6 +783,10 @@ def evaluate_redteam(security_rows: list[dict] | None = None) -> dict:
         spoof_checks, spoof_summary = _run_anti_spoofing_probes(embedder, allowed_dir, takes_a)
         for cid, st, det in spoof_checks:
             _record_check(checks, cid, 'anti_spoofing', st, det)
+
+        # Voice simulation security probes
+        for cid, st, det in _run_simulation_probes(embedder, allowed_dir, takes_a, takes_b):
+            _record_check(checks, cid, 'simulation_security', st, det)
 
     green = sum(1 for c in checks if c['status'] == STATUS_GREEN)
     yellow = sum(1 for c in checks if c['status'] == STATUS_YELLOW)

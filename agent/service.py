@@ -682,7 +682,7 @@ class VoiceAgent:
                 if not wm_ok or wm_check.score < (self._watermark_guard.z_threshold + 0.5):
                     wm_strength = min(0.035, wm_strength + 0.008)
                 if sv_score['decision'] != 'accept':
-                    formant_blend = min(0.95, formant_blend + 0.15)
+                    formant_blend = min(1.0, formant_blend + 0.18)
                     pitch_pull = min(1.0, pitch_pull + 0.15)
 
         if not converged or win_wav is None:
