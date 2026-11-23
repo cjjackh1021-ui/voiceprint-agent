@@ -21,6 +21,7 @@ from tempfile import TemporaryDirectory
 from agent.service import VoiceAgent
 from voiceprint.audio import sniff_audio_format
 from voiceprint.spoof import SpreadSpectrumWatermarkDetector
+from voiceprint.synth import VoiceSynthesizer, load_synthesizer
 
 PROTOCOL_VERSION = '2024-11-05'
 SERVER_NAME = 'voiceprint-agent-mcp'
@@ -29,7 +30,7 @@ MAX_BASE64_BYTES = 32 * 1024 * 1024
 _MAX_BASE64_CHARS = ((MAX_BASE64_BYTES + 2) // 3) * 4 + 64
 _DATA_URI_RE = re.compile(r'^data:[^;,]+;base64,', re.IGNORECASE)
 _SESSION_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,32}$')
-_WRITE_TOOLS = frozenset({'voiceprint_enroll', 'voiceprint_revoke', 'voiceprint_rotate_key'})
+_WRITE_TOOLS = frozenset({'voiceprint_enroll', 'voiceprint_revoke', 'voiceprint_rotate_key', 'voiceprint_simulate'})
 
 _TOOL_SCHEMAS = [
     {
@@ -113,6 +114,26 @@ _TOOL_SCHEMAS = [
         'description': 'Return voiceprint agent health, active embedder metadata and security guardrail flags.',
         'inputSchema': {'type': 'object', 'properties': {}},
     },
+    {
+        'name': 'voiceprint_simulate',
+        'description': 'Consent-gated voice simulation with forced 16-bit provenance watermark and Self-Refine speaker checks.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'name': {'type': 'string'},
+                'consent': {'type': 'boolean'},
+                'reference_audio_path': {'type': 'string'},
+                'reference_audio_base64': {'type': 'string'},
+                'reference_text': {'type': 'string'},
+                'source_audio_path': {'type': 'string'},
+                'source_audio_base64': {'type': 'string'},
+                'text': {'type': 'string'},
+                'max_attempts': {'type': 'integer', 'minimum': 1, 'maximum': 5},
+                'include_audio_base64': {'type': 'boolean', 'default': False},
+            },
+            'required': ['name', 'consent'],
+        },
+    },
 ]
 
 _RESOURCES = [
@@ -193,6 +214,8 @@ class VoiceprintMCPServer:
             'model': self.agent.embedder.describe(),
             'audio_roots_configured': bool(self.audio_roots),
             'spoof_guard_enabled': self.agent.spoof_detector is not None,
+            'simulation_enabled': self.agent.synthesizer is not None,
+            'synthesizer': self.agent.synthesizer.describe() if self.agent.synthesizer is not None else None,
             'read_only': self.read_only,
             'detail': bool(self.agent.detail),
             'offline_env': os.environ.get('HF_HUB_OFFLINE') == '1',
@@ -203,7 +226,11 @@ class VoiceprintMCPServer:
         orig_roots = self.agent.audio_roots
         try:
             if self.audio_roots or extra_dirs:
-                base = list(self.audio_roots) + [self.agent.separated_dir] + list(extra_dirs)
+                base = (
+                    list(self.audio_roots)
+                    + [self.agent.separated_dir, self.agent.simulated_dir]
+                    + list(extra_dirs)
+                )
                 self.agent.audio_roots = base
             yield
         finally:
@@ -364,6 +391,100 @@ class VoiceprintMCPServer:
                     out = self.agent.handle(f'注册 {shlex.quote(spk)} 本人同意 {quoted}')
                 return _tool_response(out, is_error=not out['ok'])
 
+        if name == 'voiceprint_simulate':
+            if self.agent.synthesizer is None:
+                return _tool_response({
+                    'ok': False,
+                    'error': 'synthesizer_disabled',
+                    'reply': '当前 MCP 服务未启用声音模拟合成器。',
+                }, is_error=True)
+
+            raw_spk = args.get('name')
+            if not isinstance(raw_spk, str) or not raw_spk.strip():
+                return _tool_response({'ok': False, 'error': 'invalid_arguments', 'reply': '缺少合法的 name 参数。'}, is_error=True)
+            spk = raw_spk.strip()
+
+            consent = args.get('consent', False)
+            if not isinstance(consent, bool):
+                return _tool_response({'ok': False, 'error': 'invalid_arguments', 'reply': 'consent 必须为布尔值。'}, is_error=True)
+            if consent is not True:
+                return _tool_response({'ok': False, 'error': 'consent_required', 'reply': '声音模拟必须获得明确授权（consent=true）。'}, is_error=True)
+
+            reference_text = args.get('reference_text')
+            if reference_text is not None and not isinstance(reference_text, str):
+                return _tool_response({'ok': False, 'error': 'invalid_arguments', 'reply': 'reference_text 必须为字符串。'}, is_error=True)
+
+            max_attempts = args.get('max_attempts')
+            if max_attempts is not None:
+                if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1 or max_attempts > 5:
+                    return _tool_response({'ok': False, 'error': 'invalid_arguments', 'reply': 'max_attempts 必须为 1 到 5 之间的整数。'}, is_error=True)
+
+            include_b64 = args.get('include_audio_base64', False)
+            if not isinstance(include_b64, bool):
+                return _tool_response({'ok': False, 'error': 'invalid_arguments', 'reply': 'include_audio_base64 必须为布尔值。'}, is_error=True)
+
+            has_src_path = 'source_audio_path' in args and args.get('source_audio_path') is not None
+            has_src_b64 = 'source_audio_base64' in args and args.get('source_audio_base64') is not None
+            has_text = 'text' in args and args.get('text') is not None
+            if int(has_src_path) + int(has_src_b64) + int(has_text) != 1:
+                return _tool_response({
+                    'ok': False,
+                    'error': 'invalid_arguments',
+                    'reply': '必须且只能提供 source_audio_path、source_audio_base64 或 text 之一。',
+                }, is_error=True)
+
+            with TemporaryDirectory(prefix='vpmcp_sim_') as tmp:
+                tmp_root = Path(tmp)
+                ref_path, ref_extra, ref_err = self._resolve_single_audio(
+                    args,
+                    tmp_root / 'ref',
+                    path_key='reference_audio_path',
+                    b64_key='reference_audio_base64',
+                )
+                if ref_err is not None or ref_path is None:
+                    return _tool_response(ref_err or {'ok': False, 'error': 'invalid_arguments'}, is_error=True)
+
+                extra_roots = list(ref_extra)
+                if has_text:
+                    if not isinstance(args['text'], str) or not args['text'].strip():
+                        return _tool_response({'ok': False, 'error': 'invalid_arguments', 'reply': 'text 必须为非空字符串。'}, is_error=True)
+                    sim_mode = 'text'
+                    src_path = None
+                    text_val = args['text']
+                else:
+                    sim_mode = 'audio'
+                    src_path, src_extra, src_err = self._resolve_single_audio(
+                        args,
+                        tmp_root / 'src',
+                        path_key='source_audio_path',
+                        b64_key='source_audio_base64',
+                    )
+                    if src_err is not None or src_path is None:
+                        return _tool_response(src_err or {'ok': False, 'error': 'invalid_arguments'}, is_error=True)
+                    extra_roots.extend(src_extra)
+                    text_val = None
+
+                with self._ephemeral_roots(extra_roots):
+                    out, _ = self.agent._run_simulate_core(
+                        spk,
+                        consent=True,
+                        ref_path=ref_path,
+                        mode=sim_mode,
+                        src_path=src_path,
+                        text=text_val,
+                        reference_text=reference_text,
+                        max_attempts=max_attempts,
+                    )
+                self.agent.store.audit(out['tool'], out['reply'])
+                out['model'] = self.agent.embedder.describe()
+                if out['ok'] and include_b64:
+                    out_p = Path(out['result']['output_path'])
+                    raw_out = out_p.read_bytes()
+                    if len(raw_out) > MAX_BASE64_BYTES:
+                        return _tool_response({'ok': False, 'error': 'audio_too_large', 'reply': '生成音频超出 base64 返回大小上限。'}, is_error=True)
+                    out['result']['audio_base64'] = base64.b64encode(raw_out).decode('ascii')
+                return _tool_response(out, is_error=not out['ok'])
+
         return _tool_response({'ok': False, 'error': 'unknown_tool', 'reply': f'未知工具：{name}'}, is_error=True)
 
     def handle_request(self, message: dict) -> dict | None:
@@ -400,7 +521,12 @@ class VoiceprintMCPServer:
             return _jsonrpc_ok(req_id, {})
 
         if method == 'tools/list':
-            return _jsonrpc_ok(req_id, {'tools': list(_TOOL_SCHEMAS)})
+            with self._lock:
+                tools = [
+                    t for t in _TOOL_SCHEMAS
+                    if self.agent.synthesizer is not None or t['name'] != 'voiceprint_simulate'
+                ]
+            return _jsonrpc_ok(req_id, {'tools': tools})
 
         if method == 'tools/call':
             tool_name = params.get('name')
@@ -460,6 +586,8 @@ def build_default_server(
     detail: bool = False,
     spoof_guard: bool = True,
     read_only: bool = False,
+    synthesizer: VoiceSynthesizer | None = None,
+    max_sim_attempts: int = 3,
 ) -> VoiceprintMCPServer:
     """Construct a VoiceprintMCPServer with safe defaults (detail=False, spoof_guard=True)."""
     detector = SpreadSpectrumWatermarkDetector() if spoof_guard else None
@@ -470,12 +598,13 @@ def build_default_server(
         detail=detail,
         audio_roots=resolved_roots,
         spoof_detector=detector,
+        synthesizer=synthesizer,
+        max_sim_attempts=max_sim_attempts,
     )
     return VoiceprintMCPServer(agent, audio_roots=resolved_roots, read_only=read_only)
 
 
-def main(argv: list[str] | None = None) -> None:
-    logging.basicConfig(stream=sys.stderr, level=logging.INFO, format='[%(levelname)s] %(message)s')
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Voiceprint Agent JSON-RPC 2.0 stdio MCP Server')
     parser.add_argument('--data-dir', required=True, type=Path)
     parser.add_argument('--embedder', default='vpnet', choices=['stats', 'vpnet', 'ecapa'])
@@ -483,6 +612,16 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument('--detail', action='store_true')
     parser.add_argument('--no-spoof-guard', action='store_true')
     parser.add_argument('--read-only', action='store_true')
+    parser.add_argument('--synthesizer', default='acoustic', choices=['acoustic', 'neural_subprocess', 'none'])
+    parser.add_argument('--neural-cmd', default=None)
+    parser.add_argument('--neural-timeout', type=float, default=120.0)
+    parser.add_argument('--max-sim-attempts', type=int, default=3)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    logging.basicConfig(stream=sys.stderr, level=logging.INFO, format='[%(levelname)s] %(message)s')
+    parser = build_arg_parser()
     args = parser.parse_args(argv)
 
     env_roots = os.environ.get('VOICEPRINT_MCP_AUDIO_ROOTS')
@@ -493,6 +632,11 @@ def main(argv: list[str] | None = None) -> None:
     from voiceprint.embed import load_embedder
 
     embedder = load_embedder(args.embedder)
+    synthesizer = load_synthesizer(
+        args.synthesizer,
+        neural_cmd=args.neural_cmd,
+        timeout_s=args.neural_timeout,
+    )
     server = build_default_server(
         args.data_dir,
         embedder,
@@ -500,6 +644,8 @@ def main(argv: list[str] | None = None) -> None:
         detail=args.detail,
         spoof_guard=not args.no_spoof_guard,
         read_only=args.read_only,
+        synthesizer=synthesizer,
+        max_sim_attempts=args.max_sim_attempts,
     )
     try:
         server.serve_streams(sys.stdin, sys.stdout)
