@@ -308,6 +308,55 @@ class TestVoiceSynth(unittest.TestCase):
             self.assertEqual(res.metadata.get('engine'), 'f5_tts')
             self.assertGreaterEqual(res.wav.shape[0], SR)
 
+            # Missing executable must raise SynthesisError (not OSError) and clean up temp dir
+            import tempfile
+            vpsyn_parent = Path(tempfile.gettempdir())
+            before_missing = {p.name for p in vpsyn_parent.glob('vpsyn_*')}
+            missing_syn = SubprocessNeuralSynthesizer(['/nonexistent/voiceprint_missing_bin/python'], timeout_s=5.0)
+            with self.assertRaises(SynthesisError):
+                missing_syn.synthesize(SimulationRequest(
+                    target_name='jia',
+                    mode='text',
+                    reference_audio_path=str(ref_p),
+                    text='测试不存在的可执行文件。',
+                ))
+            after_missing = {p.name for p in vpsyn_parent.glob('vpsyn_*')}
+            self.assertEqual(after_missing, before_missing)
+
+            # Missing reference/source audio in acoustic backend must also raise SynthesisError
+            with self.assertRaises(SynthesisError):
+                AcousticFormantSynthesizer().synthesize(SimulationRequest(
+                    target_name='jia',
+                    mode='audio',
+                    reference_audio_path=str(root / 'missing_ref.wav'),
+                    source_audio_path=str(ref_p),
+                ))
+
+            # Channel-first (2, T) tuple fallback without writing file_wave must average channels, not collapse time axis
+            (stub_pkg / 'api.py').write_text(
+                "import numpy as np\n"
+                "class F5TTS:\n"
+                "    def __init__(self, **kw):\n"
+                "        pass\n"
+                "    def infer(self, ref_file, ref_text, gen_text, file_wave=None, **kw):\n"
+                "        t = np.arange(24000, dtype=np.float32) / 24000.0\n"
+                "        mono = (0.3 * np.sin(2.0 * np.pi * 220.0 * t)).astype(np.float32)\n"
+                "        ch_first = np.stack([mono, mono * 0.8], axis=0)\n"
+                "        return ch_first, 24000, None\n",
+                encoding='utf-8',
+            )
+            res_ch = syn.synthesize(SimulationRequest(
+                target_name='jia',
+                mode='text',
+                reference_audio_path=str(ref_p),
+                reference_text='参考',
+                text='通道前置张量测试。',
+                gain_scale=0.85,
+                seed=8,
+            ))
+            self.assertEqual(res_ch.sr, SR)
+            self.assertGreaterEqual(res_ch.wav.shape[0], SR)
+
 
 if __name__ == '__main__':
     unittest.main()

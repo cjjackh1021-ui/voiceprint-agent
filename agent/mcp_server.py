@@ -392,6 +392,7 @@ class VoiceprintMCPServer:
                 return _tool_response(out, is_error=not out['ok'])
 
         if name == 'voiceprint_simulate':
+            self.agent.pending = None
             if self.agent.synthesizer is None:
                 return _tool_response({
                     'ok': False,
@@ -465,16 +466,24 @@ class VoiceprintMCPServer:
                     text_val = None
 
                 with self._ephemeral_roots(extra_roots):
-                    out, _ = self.agent._run_simulate_core(
-                        spk,
-                        consent=True,
-                        ref_path=ref_path,
-                        mode=sim_mode,
-                        src_path=src_path,
-                        text=text_val,
-                        reference_text=reference_text,
-                        max_attempts=max_attempts,
-                    )
+                    try:
+                        out, _ = self.agent._run_simulate_core(
+                            spk,
+                            consent=True,
+                            ref_path=ref_path,
+                            mode=sim_mode,
+                            src_path=src_path,
+                            text=text_val,
+                            reference_text=reference_text,
+                            max_attempts=max_attempts,
+                        )
+                    except Exception as exc:
+                        out = {
+                            'tool': 'simulate',
+                            'ok': False,
+                            'result': {'decision': 'reject', 'reason': 'internal_error', 'error': type(exc).__name__},
+                            'reply': f'没有完成：{exc}',
+                        }
                 self.agent.store.audit(out['tool'], out['reply'])
                 out['model'] = self.agent.embedder.describe()
                 if out['ok'] and include_b64:

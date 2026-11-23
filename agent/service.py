@@ -508,6 +508,7 @@ class VoiceAgent:
                 res.update(extra)
             return self._reply('simulate', False, res, reply), (cand_wav if collect_best_candidate else None)
 
+        self.pending = None
         if self.synthesizer is None:
             return _fail('synthesizer_disabled', '拒绝：当前未启用声音模拟合成器。')
         if consent is not True:
@@ -693,7 +694,12 @@ class VoiceAgent:
                     extra={'attempts': len(attempt_history)},
                 )
             best_wav, _, best_sv = best_payload
-            reason = 'similarity_not_converged'
+            if best_sv.get('decision') == 'accept':
+                reason = 'poor_audio_quality'
+                fail_reply = f'拒绝：经 {len(attempt_history)} 轮自检调优后音频仍存在削波等质量问题，已拦截未释放模拟音频。'
+            else:
+                reason = 'similarity_not_converged'
+                fail_reply = f'拒绝：经 {len(attempt_history)} 轮自检调优后仍未达到目标声纹验收门禁，已拦截未释放模拟音频。'
             extra_fail: dict = {
                 'attempts': len(attempt_history),
                 'backend': self.synthesizer.name,
@@ -704,7 +710,7 @@ class VoiceAgent:
                 extra_fail['best_decision'] = best_sv.get('decision')
             return _fail(
                 reason,
-                f'拒绝：经 {len(attempt_history)} 轮自检调优后仍未达到目标声纹验收门禁，已拦截未释放模拟音频。',
+                fail_reply,
                 extra=extra_fail,
                 cand_wav=best_wav,
             )

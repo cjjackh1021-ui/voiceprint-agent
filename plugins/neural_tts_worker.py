@@ -132,8 +132,14 @@ def main(argv: list[str] | None = None) -> int:
 
         gain_scale = float(req.get('gain_scale') or 0.85)
         arr = np.asarray(wav, dtype=np.float32)
-        if arr.ndim > 1:
-            arr = arr.mean(axis=1)
+        if arr.ndim > 2:
+            arr = np.squeeze(arr)
+        if arr.ndim == 2:
+            # Support both (T, C) and channel-first (C, T) outputs from neural backends
+            axis = 1 if arr.shape[1] <= arr.shape[0] else 0
+            arr = arr.mean(axis=axis)
+        elif arr.ndim > 2:
+            raise ValueError(f'Unsupported audio tensor shape: {tuple(arr.shape)}')
         arr = arr.reshape(-1)
         peak = float(np.max(np.abs(arr))) if arr.size else 0.0
         if peak > 0.98 or gain_scale < 0.99:

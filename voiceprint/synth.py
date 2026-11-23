@@ -113,9 +113,12 @@ def validate_simulation_result(
 
 
 def _read_mono_16k(path: str, max_seconds: float = 30.0) -> np.ndarray:
-    info = sf.info(str(path))
-    max_frames = int(max(1.0, float(max_seconds)) * int(info.samplerate))
-    wav, sr = sf.read(str(path), frames=max_frames, dtype='float32', always_2d=False)
+    try:
+        info = sf.info(str(path))
+        max_frames = int(max(1.0, float(max_seconds)) * int(info.samplerate))
+        wav, sr = sf.read(str(path), frames=max_frames, dtype='float32', always_2d=False)
+    except (OSError, sf.LibsndfileError) as exc:
+        raise SynthesisError(f'无法读取参考/源音频（{type(exc).__name__}）：{exc}') from None
     arr = np.asarray(wav, dtype=np.float64)
     if arr.size == 0 or not bool(np.all(np.isfinite(arr))):
         raise SynthesisError(f'参考/源音频无效或为空：{path}')
@@ -495,12 +498,15 @@ class SubprocessNeuralSynthesizer(VoiceSynthesizer):
             }
             req_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
 
-            res = run_contained(
-                self.cmd + ['--request', str(req_path)],
-                timeout=self.timeout_s,
-                cwd=self.cwd,
-                env=child_env,
-            )
+            try:
+                res = run_contained(
+                    self.cmd + ['--request', str(req_path)],
+                    timeout=self.timeout_s,
+                    cwd=self.cwd,
+                    env=child_env,
+                )
+            except OSError as exc:
+                raise SynthesisError(f'无法启动外部神经合成进程（{type(exc).__name__}）：{exc}') from None
             if res.timed_out:
                 raise SynthesisError(f'外部神经合成子进程超时（>{self.timeout_s:.1f}s），已强杀进程树。')
             stdout_txt = res.stdout.decode('utf-8', errors='replace').strip()

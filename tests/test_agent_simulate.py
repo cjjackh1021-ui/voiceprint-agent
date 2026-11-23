@@ -309,6 +309,50 @@ class TestAgentSimulate(unittest.TestCase):
             finally:
                 ag.close()
 
+    def test_simulate_always_clipping_accept_reports_poor_audio_quality(self):
+        embedder = ToneEmbedder()
+        with patched_dpapi(), sandbox_cohort(embedder), TemporaryDirectory(prefix='vpsim_clip_') as tmp:
+            root = Path(tmp)
+            audio_dir = root / 'audio'
+            audio_dir.mkdir()
+            target_sample = generate_speaker_wav(audio_dir / 'target_clean.wav', speaker_index=0, duration=2.0, seed=71)
+
+            class _AlwaysClipTargetSynthesizer(VoiceSynthesizer):
+                name = 'always_clip_target'
+                supported_modes = ('text',)
+
+                def synthesize(self, req: SimulationRequest) -> SimulationResult:
+                    wav, sr = sf.read(str(target_sample), dtype='float32')
+                    clipped = np.clip(wav * 8.0, -1.0, 1.0).astype(np.float32)
+                    return SimulationResult(wav=clipped, sr=sr, backend=self.name, metadata={})
+
+            agent = VoiceAgent(
+                root / 'db',
+                embedder,
+                detail=False,
+                audio_roots=[audio_dir],
+                synthesizer=_AlwaysClipTargetSynthesizer(),
+                max_sim_attempts=2,
+            )
+            try:
+                takes_a = sandbox_enroll(agent, '甲', audio_dir / 'enr_a', speaker_index=0)
+                out, cand = agent._run_simulate_core(
+                    '甲',
+                    consent=True,
+                    ref_path=str(takes_a[0]),
+                    mode='text',
+                    text='削波归因测试',
+                    collect_best_candidate=True,
+                )
+                self.assertFalse(out['ok'])
+                self.assertEqual(out['result']['reason'], 'poor_audio_quality')
+                self.assertIsNotNone(cand)
+                self.assertFalse(any(agent.simulated_dir.glob('*.wav')) if agent.simulated_dir.exists() else False)
+                for term in FORBIDDEN_NON_DETAIL_TERMS:
+                    self.assertNotIn(term, out['reply'])
+            finally:
+                agent.close()
+
 
 if __name__ == '__main__':
     unittest.main()

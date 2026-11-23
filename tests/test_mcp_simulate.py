@@ -301,6 +301,89 @@ class TestMCPSimulate(unittest.TestCase):
         args_off = parser.parse_args(['--data-dir', '/tmp/db', '--synthesizer', 'none'])
         self.assertEqual(args_off.synthesizer, 'none')
 
+    def test_mcp_simulate_clears_pending_revoke_and_catches_missing_neural_cmd(self):
+        from voiceprint.synth import SubprocessNeuralSynthesizer
+
+        embedder = ToneEmbedder()
+        with patched_dpapi(), sandbox_cohort(embedder), TemporaryDirectory(prefix='vpmcp_fix_') as tmp:
+            root = Path(tmp)
+            allowed = root / 'allowed'
+            allowed.mkdir()
+            takes = sandbox_enroll_takes(allowed, 'jia', speaker_index=0)
+            src = generate_speaker_wav(allowed / 'src.wav', speaker_index=1, duration=2.0, seed=19)
+
+            srv = build_default_server(
+                root / 'db_pending',
+                embedder,
+                audio_roots=[allowed],
+                synthesizer=AcousticFormantSynthesizer(),
+            )
+            try:
+                _call_tool(srv, 'voiceprint_enroll', {
+                    'name': '甲',
+                    'consent': True,
+                    'audio_paths': [str(p) for p in takes],
+                })
+                ask_rev = _call_tool(srv, 'voiceprint_revoke', {'name': '甲', 'confirm': False})
+                self.assertFalse(ask_rev['result'].get('isError', False), ask_rev)
+
+                sim = _call_tool(srv, 'voiceprint_simulate', {
+                    'name': '甲',
+                    'consent': True,
+                    'reference_audio_path': str(takes[0]),
+                    'source_audio_path': str(src),
+                })
+                self.assertFalse(sim['result'].get('isError', False), sim)
+
+                # Intermediate voiceprint_simulate must invalidate pending two-step revoke
+                conf_rev = _call_tool(srv, 'voiceprint_revoke', {'name': '甲', 'confirm': True})
+                self.assertTrue(conf_rev['result'].get('isError'))
+                self.assertTrue(srv.agent.store.exists('甲'))
+            finally:
+                srv.agent.close()
+
+            srv_bad = build_default_server(
+                root / 'db_missing_bin',
+                embedder,
+                audio_roots=[allowed],
+                synthesizer=SubprocessNeuralSynthesizer(['/nonexistent/voiceprint_missing_bin/python'], timeout_s=5.0),
+            )
+            try:
+                _call_tool(srv_bad, 'voiceprint_enroll', {
+                    'name': '甲',
+                    'consent': True,
+                    'audio_paths': [str(p) for p in takes],
+                })
+                before_audits = srv_bad.agent.store.db.execute(
+                    "select count(*) from audit where action='simulate'"
+                ).fetchone()[0]
+                resp = srv_bad.handle_request({
+                    'jsonrpc': '2.0',
+                    'id': 99,
+                    'method': 'tools/call',
+                    'params': {
+                        'name': 'voiceprint_simulate',
+                        'arguments': {
+                            'name': '甲',
+                            'consent': True,
+                            'reference_audio_path': str(takes[0]),
+                            'text': '缺失可执行文件测试',
+                        },
+                    },
+                })
+                self.assertIsNotNone(resp)
+                self.assertIn('result', resp)
+                self.assertTrue(resp['result'].get('isError'))
+                payload = _parse_payload(resp)
+                self.assertFalse(payload['ok'])
+                self.assertEqual(payload['result']['reason'], 'synthesis_failed')
+                after_audits = srv_bad.agent.store.db.execute(
+                    "select count(*) from audit where action='simulate'"
+                ).fetchone()[0]
+                self.assertEqual(after_audits, before_audits + 1)
+            finally:
+                srv_bad.agent.close()
+
 
 if __name__ == '__main__':
     unittest.main()
