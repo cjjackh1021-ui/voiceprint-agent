@@ -246,6 +246,68 @@ class TestVoiceSynth(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_synthesizer('unknown_backend')
 
+    def test_neural_tts_worker_cli_help_and_zero_core_dependency(self):
+        import os
+        from voiceprint.contained_subprocess import run_contained
+
+        repo_root = Path(__file__).resolve().parents[1]
+        worker_script = repo_root / 'plugins' / 'neural_tts_worker.py'
+        help_res = run_contained([sys.executable, str(worker_script), '--help'], timeout=10.0)
+        self.assertEqual(help_res.returncode, 0, help_res.stderr.decode('utf-8', errors='replace'))
+
+        with TemporaryDirectory(prefix='vpworker_') as tmp:
+            root = Path(tmp)
+            ref_p = generate_speaker_wav(root / 'ref.wav', speaker_index=0, duration=1.5)
+
+            # Passing unsupported mode='audio' to --engine f5_tts returns structured error
+            bad_req = root / 'bad_req.json'
+            bad_req.write_text(json.dumps({
+                'mode': 'audio',
+                'reference_audio_path': str(ref_p),
+                'source_audio_path': str(ref_p),
+                'output_wav_path': str(root / 'bad_out.wav'),
+            }), encoding='utf-8')
+            bad_res = run_contained([sys.executable, str(worker_script), '--engine', 'f5_tts', '--request', str(bad_req)], timeout=10.0)
+            self.assertNotEqual(bad_res.returncode, 0)
+            self.assertIn('unsupported', bad_res.stderr.decode('utf-8', errors='replace').lower() + bad_res.stdout.decode('utf-8', errors='replace').lower())
+
+            # Inject stub f5_tts.api module via PYTHONPATH to test end-to-end SubprocessNeuralSynthesizer protocol
+            stub_pkg = root / 'stub_site' / 'f5_tts'
+            stub_pkg.mkdir(parents=True)
+            (stub_pkg / '__init__.py').write_text('', encoding='utf-8')
+            (stub_pkg / 'api.py').write_text(
+                "import numpy as np, soundfile as sf\n"
+                "class F5TTS:\n"
+                "    def __init__(self, **kw):\n"
+                "        print('noisy model init banner on stdout!')\n"
+                "    def infer(self, ref_file, ref_text, gen_text, file_wave=None, **kw):\n"
+                "        assert ref_text == '参考朗读句子' and '测试中文' in gen_text\n"
+                "        t = np.arange(24000, dtype=np.float32) / 24000.0\n"
+                "        wav = (0.3 * np.sin(2.0 * np.pi * 220.0 * t)).astype(np.float32)\n"
+                "        if file_wave:\n"
+                "            sf.write(file_wave, wav, 24000)\n"
+                "        return wav, 24000, None\n",
+                encoding='utf-8',
+            )
+            syn = SubprocessNeuralSynthesizer(
+                [sys.executable, str(worker_script), '--engine', 'f5_tts'],
+                timeout_s=15.0,
+                env_overrides={'PYTHONPATH': f"{root / 'stub_site'}{os.pathsep}{repo_root}"},
+            )
+            res = syn.synthesize(SimulationRequest(
+                target_name='jia',
+                mode='text',
+                reference_audio_path=str(ref_p),
+                reference_text='参考朗读句子',
+                text='测试中文神经克隆协议。',
+                gain_scale=0.85,
+                seed=7,
+            ))
+            self.assertEqual(res.sr, SR)
+            self.assertEqual(res.backend, 'neural_subprocess')
+            self.assertEqual(res.metadata.get('engine'), 'f5_tts')
+            self.assertGreaterEqual(res.wav.shape[0], SR)
+
 
 if __name__ == '__main__':
     unittest.main()
